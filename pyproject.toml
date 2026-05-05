@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot2lance"
+version = "0.1.0"
+description = "Convert LeRobot v2.1 / v3 datasets into a three-table Lance bundle (episodes/frames/videos)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "pyarrow>=16.0",
+  "pylance>=0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+lerobot2lance = "lerobot2lance.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lerobot2lance*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
