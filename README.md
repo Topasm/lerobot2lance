@@ -45,7 +45,7 @@ Useful flags:
 | `--overwrite` | Replace any existing `*.lance` directories under `--target` |
 | `--limit N` | Convert only the first N episodes (smoke testing) |
 | `--no-frames` | Skip writing `frames.lance` (saves disk if your trainer only reads `episodes.lance`) |
-| `--no-video-blobs` | Omit per-camera video blobs from `episodes.lance` (videos.lance still has the raw MP4 rows) |
+| `--no-video-blobs` | Omit per-camera video blobs from `episodes.lance` (`media.lance` still has the raw MP4 rows) |
 
 ### Python API
 
@@ -73,7 +73,6 @@ target/
   frames.lance/          # one row per frame: episode_index, frame_index, timestamp,
                          # task_index, observation_state, action, QA norms/flags
   media.lance/           # canonical media index with sha256 + raw bytes blob
-  videos.lance/          # legacy media alias for older viewers
   meta/
     info.json            # copy of the source LeRobot info.json (used by viewers for codec metadata)
 ```
@@ -100,8 +99,6 @@ Camera-name normalization: `observation.images.cam_head` → `observation_images
 
 `media.lance` is the canonical media table. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `camera_key`, `media_type`, `relative_path`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, `codec`, and `video_blob`.
 
-`videos.lance` is kept as a legacy compatibility table with columns: `camera_angle` (normalized name), `chunk_index`, `file_index`, `relative_path`, `filename`, `file_size_bytes`, `sha256`, `video_blob`.
-
 `manifest.json` marks `episodes.lance` as the `primary_training_table`, records `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. This lets `rllab-training`, `robo_dataview`, and the stack scripts share one contract without extra CLI flags.
 
 ## Examples
@@ -120,7 +117,7 @@ Result (10 episodes, 3 cameras at 376×672 / 240×424):
   "layout_detected": "v2_1",
   "episodes_written": 10,
   "frames_written": 3150,
-  "videos_written": 30,
+  "media_written": 30,
   "fps": 30.0,
   "cameras": [
     "observation_images_cam_head",

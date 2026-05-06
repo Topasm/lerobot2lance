@@ -135,12 +135,13 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(report["episodes_written"], 2)
             self.assertEqual(report["frames_written"], 8)
             self.assertEqual(report["media_written"], 2)
-            self.assertEqual(report["videos_written"], 2)
+            self.assertNotIn("videos_written", report)
             self.assertEqual(report["fps"], 30.0)
             self.assertEqual(report["cameras"], ["observation_images_cam_head"])
             self.assertEqual([e[0] for e in events], ["episode_converted"] * 2)
-            for name in ("episodes.lance", "frames.lance", "media.lance", "videos.lance"):
+            for name in ("episodes.lance", "frames.lance", "media.lance"):
                 self.assertTrue((target / name).exists(), f"{name} missing")
+            self.assertFalse((target / "videos.lance").exists())
             self.assertTrue((target / "manifest.json").exists())
             # Source info.json copied — downstream camera_info discovery relies on this.
             self.assertTrue((target / "meta" / "info.json").exists())
@@ -221,7 +222,7 @@ class LerobotToLanceConversionTest(unittest.TestCase):
 
             self.assertEqual(report["episodes_written"], 1)
             self.assertEqual(report["frames_written"], 2)
-            self.assertEqual(report["videos_written"], 1)
+            self.assertEqual(report["media_written"], 1)
 
     def test_no_video_blobs_omits_blob_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -243,8 +244,8 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             # were written.
             if handle is not None:
                 self.assertEqual(handle.get("size", 0), 0)
-            videos = lance.dataset(str(target / "videos.lance"))
-            self.assertEqual(videos.count_rows(), 2)
+            media = lance.dataset(str(target / "media.lance"))
+            self.assertEqual(media.count_rows(), 2)
 
 
 class ErrorPathTest(unittest.TestCase):

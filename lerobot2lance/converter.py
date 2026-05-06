@@ -27,7 +27,6 @@ CONVERSION_REPORT_KEYS = (
     "episodes_written",
     "frames_written",
     "media_written",
-    "videos_written",
     "fps",
     "cameras",
 )
@@ -75,13 +74,13 @@ def convert_lerobot_to_lance(
     if not episode_meta_rows:
         raise ValueError("No episode metadata rows found in source dataset")
 
-    table_names = ("episodes.lance", "frames.lance", "media.lance", "videos.lance")
-    if any((target / name).exists() for name in table_names):
+    stale_table_names = ("episodes.lance", "frames.lance", "media.lance", "videos.lance")
+    if any((target / name).exists() for name in stale_table_names):
         if not overwrite:
             raise FileExistsError(
                 f"Target already contains Lance tables (use overwrite=True): {target}"
             )
-        for name in table_names:
+        for name in stale_table_names:
             shutil.rmtree(target / name, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
 
@@ -91,7 +90,6 @@ def convert_lerobot_to_lance(
     frame_rows: list[dict[str, Any]] = []
     episode_rows: list[dict[str, Any]] = []
     media_rows: list[dict[str, Any]] = []
-    video_rows: list[dict[str, Any]] = []
     seen_video_paths: set[str] = set()
 
     total = len(episode_meta_rows)
@@ -211,18 +209,6 @@ def convert_lerobot_to_lance(
                         feature_info=feature_info,
                     )
                 )
-                video_rows.append(
-                    {
-                        "camera_angle": camera_norm,
-                        "chunk_index": chunk_index,
-                        "file_index": episode_index,
-                        "relative_path": str(video_path.relative_to(source)),
-                        "filename": video_path.name,
-                        "file_size_bytes": len(blob),
-                        "sha256": hashlib.sha256(blob).hexdigest(),
-                        "video_blob": blob,
-                    }
-                )
 
         episode_rows.append(episode_row)
         if progress_callback:
@@ -249,11 +235,6 @@ def convert_lerobot_to_lance(
         media_table = pa.Table.from_pylist(media_rows, schema=media_schema)
         lance.write_dataset(media_table, str(target / "media.lance"), mode="overwrite")
 
-    if video_rows:
-        videos_schema = _build_videos_schema(pa)
-        videos_table = pa.Table.from_pylist(video_rows, schema=videos_schema)
-        lance.write_dataset(videos_table, str(target / "videos.lance"), mode="overwrite")
-
     target_meta = target / "meta"
     target_meta.mkdir(parents=True, exist_ok=True)
     (target_meta / "info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
@@ -266,7 +247,6 @@ def convert_lerobot_to_lance(
         cameras_norm=cameras_norm,
         include_frames=include_frames and bool(frame_rows),
         has_media=bool(media_rows),
-        has_videos=bool(video_rows),
         state_dim=_nested_dim(states),
         action_dim=_nested_dim(actions),
         episodes_written=len(episode_rows),
@@ -280,7 +260,6 @@ def convert_lerobot_to_lance(
         "episodes_written": len(episode_rows),
         "frames_written": len(frame_rows) if include_frames else 0,
         "media_written": len(media_rows),
-        "videos_written": len(video_rows),
         "fps": fps,
         "cameras": cameras_norm,
     }
@@ -551,7 +530,6 @@ def _write_manifest(
     cameras_norm: list[str],
     include_frames: bool,
     has_media: bool,
-    has_videos: bool,
     state_dim: int,
     action_dim: int,
     episodes_written: int,
@@ -565,8 +543,6 @@ def _write_manifest(
         tables["frames"] = "frames.lance"
     if has_media:
         tables["media"] = "media.lance"
-    if has_videos:
-        tables["legacy_videos"] = "videos.lance"
 
     manifest = {
         "format": "rllab_lance_session_v1",
@@ -576,7 +552,6 @@ def _write_manifest(
         "primary_training_table": "episodes.lance",
         "frame_table": "frames.lance" if include_frames else None,
         "media_table": "media.lance" if has_media else None,
-        "legacy_video_table": "videos.lance" if has_videos else None,
         "state_column": "observation_state",
         "action_column": "actions",
         "training_columns": {
@@ -688,25 +663,6 @@ def _build_media_schema(pa: Any) -> Any:
             pa.field("codec", pa.string()),
             pa.field("chunk_index", pa.int64()),
             pa.field("file_index", pa.int64()),
-            pa.field(
-                "video_blob",
-                pa.large_binary(),
-                metadata={b"lance-encoding:blob": b"true"},
-            ),
-        ]
-    )
-
-
-def _build_videos_schema(pa: Any) -> Any:
-    return pa.schema(
-        [
-            pa.field("camera_angle", pa.string(), nullable=False),
-            pa.field("chunk_index", pa.int64()),
-            pa.field("file_index", pa.int64()),
-            pa.field("relative_path", pa.string()),
-            pa.field("filename", pa.string()),
-            pa.field("file_size_bytes", pa.int64()),
-            pa.field("sha256", pa.string()),
             pa.field(
                 "video_blob",
                 pa.large_binary(),

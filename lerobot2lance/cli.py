@@ -36,7 +36,7 @@ def main() -> int:
     parser.add_argument(
         "--no-video-blobs",
         action="store_true",
-        help="Omit video blob columns from episodes.lance (videos.lance still written)",
+        help="Omit video blob columns from episodes.lance (media.lance still keeps source MP4 blobs)",
     )
     args = parser.parse_args()
 
