@@ -1,6 +1,6 @@
 # lerobot2lance
 
-Convert a local **[LeRobot](https://github.com/huggingface/lerobot)** v2.1 or v3 dataset into a three-table **[Lance](https://lancedb.com/)** bundle (`episodes.lance` + `frames.lance` + `videos.lance`) that downstream Lance-native tools can open directly.
+Convert a local **[LeRobot](https://github.com/huggingface/lerobot)** v2.1 or v3 dataset into a **[Lance](https://lancedb.com/)** session bundle that downstream Lance-native tools can open directly.
 
 The two LeRobot disk layouts are auto-detected:
 
@@ -68,10 +68,12 @@ A `progress_callback(kind, payload)` is invoked once per episode with `kind="epi
 
 ```text
 target/
+  manifest.json           # rllab_lance_session_v1 contract for viewers/trainers
   episodes.lance/        # one row per episode, includes per-camera *_video_blob columns
   frames.lance/          # one row per frame: episode_index, frame_index, timestamp,
-                         # task_index, observation_state, action
-  videos.lance/          # one row per source MP4 file with sha256 + raw bytes blob
+                         # task_index, observation_state, action, QA norms/flags
+  media.lance/           # canonical media index with sha256 + raw bytes blob
+  videos.lance/          # legacy media alias for older viewers
   meta/
     info.json            # copy of the source LeRobot info.json (used by viewers for codec metadata)
 ```
@@ -94,7 +96,13 @@ target/
 
 Camera-name normalization: `observation.images.cam_head` → `observation_images_cam_head` (Lance column-name rules require underscore-only). The original dotted name stays in `meta/info.json` for viewer reference.
 
-`videos.lance` columns: `camera_angle` (normalized name), `chunk_index`, `file_index`, `relative_path`, `filename`, `file_size_bytes`, `sha256`, `video_blob`.
+`frames.lance` also includes `global_frame_index`, `state_norm`, `action_norm`, and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic statistics.
+
+`media.lance` is the canonical media table. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `camera_key`, `media_type`, `relative_path`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, `codec`, and `video_blob`.
+
+`videos.lance` is kept as a legacy compatibility table with columns: `camera_angle` (normalized name), `chunk_index`, `file_index`, `relative_path`, `filename`, `file_size_bytes`, `sha256`, `video_blob`.
+
+`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. This lets `rllab-training`, `robo_dataview`, and the stack scripts share one contract without extra CLI flags.
 
 ## Examples
 
@@ -147,7 +155,7 @@ dataset:
   root: /tmp/ffw_lance
 ```
 
-`rllab_training.data.EpisodeDataset` reads `episodes.lance` directly — no further conversion step.
+`rllab_training.data.EpisodeDataset` reads the generated `manifest.json` and then uses `episodes.lance` as the primary training table — no further conversion step.
 
 ## Troubleshooting
 

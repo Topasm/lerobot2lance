@@ -1,6 +1,5 @@
-"""Convert a LeRobot v2.1 or v3.0 dataset on disk into the three-table Lance
-bundle (`episodes.lance`, `frames.lance`, `videos.lance`) consumed by
-downstream Lance-native viewers and trainers.
+"""Convert a LeRobot v2.1 or v3.0 dataset on disk into a Lance session bundle
+consumed by downstream Lance-native viewers and trainers.
 
 Both LeRobot layouts (v2.1 single-Parquet-per-episode, v3 sharded file
 Parquets) are auto-detected and produce the same Lance bundle shape. The
@@ -12,6 +11,7 @@ the original LeRobot tree.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -26,6 +26,7 @@ CONVERSION_REPORT_KEYS = (
     "layout_detected",
     "episodes_written",
     "frames_written",
+    "media_written",
     "videos_written",
     "fps",
     "cameras",
@@ -74,7 +75,7 @@ def convert_lerobot_to_lance(
     if not episode_meta_rows:
         raise ValueError("No episode metadata rows found in source dataset")
 
-    table_names = ("episodes.lance", "frames.lance", "videos.lance")
+    table_names = ("episodes.lance", "frames.lance", "media.lance", "videos.lance")
     if any((target / name).exists() for name in table_names):
         if not overwrite:
             raise FileExistsError(
@@ -89,6 +90,7 @@ def convert_lerobot_to_lance(
 
     frame_rows: list[dict[str, Any]] = []
     episode_rows: list[dict[str, Any]] = []
+    media_rows: list[dict[str, Any]] = []
     video_rows: list[dict[str, Any]] = []
     seen_video_paths: set[str] = set()
 
@@ -142,22 +144,33 @@ def convert_lerobot_to_lance(
 
         if include_frames:
             for frame in ep_frames:
+                frame_index = int(frame.get("frame_index", frame.get("index", 0)))
+                state = _as_float_list(frame.get("observation.state"))
+                action = _as_float_list(frame.get("action"))
                 frame_rows.append(
                     {
                         "episode_index": episode_index,
-                        "frame_index": int(
-                            frame.get("frame_index", frame.get("index", 0))
+                        "frame_index": frame_index,
+                        "global_frame_index": int(
+                            frame.get(
+                                "index",
+                                episode_index * len(ep_frames) + frame_index,
+                            )
                         ),
                         "timestamp": float(frame.get("timestamp") or 0.0),
                         "task_index": int(
                             frame.get("task_index") or episode_task_index or 0
                         ),
-                        "observation_state": _as_float_list(frame.get("observation.state")),
-                        "action": _as_float_list(frame.get("action")),
+                        "observation_state": state,
+                        "action": action,
+                        "state_norm": _vector_norm(state),
+                        "action_norm": _vector_norm(action),
+                        "is_bad_frame": False,
                     }
                 )
 
         for camera_key, camera_norm in zip(camera_keys, cameras_norm):
+            feature_info = (info.get("features") or {}).get(camera_key) or {}
             video_path = _video_path(
                 source,
                 info,
@@ -183,6 +196,21 @@ def convert_lerobot_to_lance(
             video_key = str(video_path.resolve())
             if video_key not in seen_video_paths:
                 seen_video_paths.add(video_key)
+                media_rows.append(
+                    _media_row(
+                        info=info,
+                        camera_key=camera_key,
+                        camera_norm=camera_norm,
+                        video_path=video_path,
+                        source=source,
+                        blob=blob,
+                        episode_index=episode_index,
+                        chunk_index=chunk_index,
+                        fps=fps,
+                        num_frames=len(ep_frames),
+                        feature_info=feature_info,
+                    )
+                )
                 video_rows.append(
                     {
                         "camera_angle": camera_norm,
@@ -216,6 +244,11 @@ def convert_lerobot_to_lance(
         frames_table = pa.Table.from_pylist(frame_rows, schema=frames_schema)
         lance.write_dataset(frames_table, str(target / "frames.lance"), mode="overwrite")
 
+    if media_rows:
+        media_schema = _build_media_schema(pa)
+        media_table = pa.Table.from_pylist(media_rows, schema=media_schema)
+        lance.write_dataset(media_table, str(target / "media.lance"), mode="overwrite")
+
     if video_rows:
         videos_schema = _build_videos_schema(pa)
         videos_table = pa.Table.from_pylist(video_rows, schema=videos_schema)
@@ -224,6 +257,21 @@ def convert_lerobot_to_lance(
     target_meta = target / "meta"
     target_meta.mkdir(parents=True, exist_ok=True)
     (target_meta / "info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    _write_manifest(
+        target,
+        source=source,
+        layout=layout,
+        fps=fps,
+        camera_keys=camera_keys,
+        cameras_norm=cameras_norm,
+        include_frames=include_frames and bool(frame_rows),
+        has_media=bool(media_rows),
+        has_videos=bool(video_rows),
+        state_dim=_nested_dim(states),
+        action_dim=_nested_dim(actions),
+        episodes_written=len(episode_rows),
+        frames_written=len(frame_rows) if include_frames else 0,
+    )
 
     return {
         "source": str(source),
@@ -231,6 +279,7 @@ def convert_lerobot_to_lance(
         "layout_detected": layout,
         "episodes_written": len(episode_rows),
         "frames_written": len(frame_rows) if include_frames else 0,
+        "media_written": len(media_rows),
         "videos_written": len(video_rows),
         "fps": fps,
         "cameras": cameras_norm,
@@ -424,6 +473,132 @@ def _as_float_list(value: Any) -> list[float]:
     return [float(item) for item in value]
 
 
+def _vector_norm(value: list[float]) -> float:
+    return float(sum(item * item for item in value) ** 0.5)
+
+
+def _nested_dim(value: list[list[float]]) -> int:
+    for row in value:
+        if row:
+            return len(row)
+    return 0
+
+
+def _video_shape(feature_info: dict[str, Any]) -> tuple[int | None, int | None]:
+    shape = feature_info.get("shape")
+    if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+        return int(shape[0]), int(shape[1])
+    return None, None
+
+
+def _video_codec(feature_info: dict[str, Any]) -> str | None:
+    nested = feature_info.get("info")
+    if isinstance(nested, dict):
+        codec = nested.get("video.codec") or nested.get("codec")
+        if codec:
+            return str(codec)
+    codec = feature_info.get("video.codec") or feature_info.get("codec")
+    return str(codec) if codec else None
+
+
+def _media_row(
+    *,
+    info: dict[str, Any],
+    camera_key: str,
+    camera_norm: str,
+    video_path: Path,
+    source: Path,
+    blob: bytes,
+    episode_index: int,
+    chunk_index: int,
+    fps: float,
+    num_frames: int,
+    feature_info: dict[str, Any],
+) -> dict[str, Any]:
+    height, width = _video_shape(feature_info)
+    rel = str(video_path.relative_to(source))
+    return {
+        "media_id": f"episode_{episode_index:06d}_{camera_norm}",
+        "episode_id": f"episode_{episode_index:06d}",
+        "episode_index": episode_index,
+        "camera_id": camera_norm,
+        "camera_name": camera_key,
+        "camera_key": camera_key,
+        "media_type": "video",
+        "uri": rel,
+        "relative_path": rel,
+        "filename": video_path.name,
+        "sha256": hashlib.sha256(blob).hexdigest(),
+        "byte_size": len(blob),
+        "num_frames": int(num_frames),
+        "fps": float(fps),
+        "width_pixels": width,
+        "height_pixels": height,
+        "codec": _video_codec(feature_info),
+        "chunk_index": int(chunk_index),
+        "file_index": int(episode_index),
+        "video_blob": blob,
+    }
+
+
+def _write_manifest(
+    target: Path,
+    *,
+    source: Path,
+    layout: str,
+    fps: float,
+    camera_keys: list[str],
+    cameras_norm: list[str],
+    include_frames: bool,
+    has_media: bool,
+    has_videos: bool,
+    state_dim: int,
+    action_dim: int,
+    episodes_written: int,
+    frames_written: int,
+) -> None:
+    tables = {
+        "episodes": "episodes.lance",
+        "primary_training": "episodes.lance",
+    }
+    if include_frames:
+        tables["frames"] = "frames.lance"
+    if has_media:
+        tables["media"] = "media.lance"
+    if has_videos:
+        tables["legacy_videos"] = "videos.lance"
+
+    manifest = {
+        "format": "rllab_lance_session_v1",
+        "source_format": f"lerobot_{layout}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source": str(source),
+        "primary_training_table": "episodes.lance",
+        "frame_table": "frames.lance" if include_frames else None,
+        "media_table": "media.lance" if has_media else None,
+        "legacy_video_table": "videos.lance" if has_videos else None,
+        "state_column": "observation_state",
+        "action_column": "actions",
+        "training_columns": {
+            "state": "observation_state",
+            "action": "actions",
+        },
+        "camera_keys": camera_keys,
+        "camera_columns": cameras_norm,
+        "fps": float(fps),
+        "state_dim": int(state_dim),
+        "action_dim": int(action_dim),
+        "media_mode": "episode_blob",
+        "tables": tables,
+        "counts": {
+            "episodes": int(episodes_written),
+            "frames": int(frames_written),
+        },
+    }
+    text = json.dumps(manifest, indent=2, sort_keys=True)
+    (target / "manifest.json").write_text(text, encoding="utf-8")
+
+
 def _caption_from_meta_tasks(row: dict[str, Any]) -> str | None:
     tasks = row.get("tasks")
     if isinstance(tasks, (list, tuple)) and tasks and isinstance(tasks[0], str):
@@ -479,10 +654,45 @@ def _build_frames_schema(pa: Any) -> Any:
         [
             pa.field("episode_index", pa.int64(), nullable=False),
             pa.field("frame_index", pa.int64(), nullable=False),
+            pa.field("global_frame_index", pa.int64()),
             pa.field("timestamp", pa.float64()),
             pa.field("task_index", pa.int64()),
             pa.field("observation_state", pa.list_(pa.float32())),
             pa.field("action", pa.list_(pa.float32())),
+            pa.field("state_norm", pa.float32()),
+            pa.field("action_norm", pa.float32()),
+            pa.field("is_bad_frame", pa.bool_(), nullable=False),
+        ]
+    )
+
+
+def _build_media_schema(pa: Any) -> Any:
+    return pa.schema(
+        [
+            pa.field("media_id", pa.string(), nullable=False),
+            pa.field("episode_id", pa.string()),
+            pa.field("episode_index", pa.int64(), nullable=False),
+            pa.field("camera_id", pa.string()),
+            pa.field("camera_name", pa.string()),
+            pa.field("camera_key", pa.string()),
+            pa.field("media_type", pa.string()),
+            pa.field("uri", pa.string()),
+            pa.field("relative_path", pa.string()),
+            pa.field("filename", pa.string()),
+            pa.field("sha256", pa.string()),
+            pa.field("byte_size", pa.int64()),
+            pa.field("num_frames", pa.int64()),
+            pa.field("fps", pa.float64()),
+            pa.field("width_pixels", pa.int32()),
+            pa.field("height_pixels", pa.int32()),
+            pa.field("codec", pa.string()),
+            pa.field("chunk_index", pa.int64()),
+            pa.field("file_index", pa.int64()),
+            pa.field(
+                "video_blob",
+                pa.large_binary(),
+                metadata={b"lance-encoding:blob": b"true"},
+            ),
         ]
     )
 

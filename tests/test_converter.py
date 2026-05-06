@@ -118,7 +118,7 @@ def _write_v2_1_dataset(root: Path, *, episodes: int = 2, length: int = 4) -> No
 
 @unittest.skipUnless(HAS_CONVERSION_DEPS, "requires pyarrow + lance")
 class LerobotToLanceConversionTest(unittest.TestCase):
-    def test_v2_1_writes_three_lance_tables(self) -> None:
+    def test_v2_1_writes_lance_session_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "lerobot"
             target = Path(tmpdir) / "lance"
@@ -134,12 +134,14 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(report["layout_detected"], "v2_1")
             self.assertEqual(report["episodes_written"], 2)
             self.assertEqual(report["frames_written"], 8)
+            self.assertEqual(report["media_written"], 2)
             self.assertEqual(report["videos_written"], 2)
             self.assertEqual(report["fps"], 30.0)
             self.assertEqual(report["cameras"], ["observation_images_cam_head"])
             self.assertEqual([e[0] for e in events], ["episode_converted"] * 2)
-            for name in ("episodes.lance", "frames.lance", "videos.lance"):
+            for name in ("episodes.lance", "frames.lance", "media.lance", "videos.lance"):
                 self.assertTrue((target / name).exists(), f"{name} missing")
+            self.assertTrue((target / "manifest.json").exists())
             # Source info.json copied — downstream camera_info discovery relies on this.
             self.assertTrue((target / "meta" / "info.json").exists())
 
@@ -153,6 +155,49 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(row[0]["language_instruction"], "pick-and-place")
             self.assertEqual(row[0]["fps"], 30.0)
             self.assertEqual(row[0]["length"], 4)
+
+            manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["format"], "rllab_lance_session_v1")
+            self.assertEqual(manifest["primary_training_table"], "episodes.lance")
+            self.assertEqual(manifest["training_columns"]["state"], "observation_state")
+            self.assertEqual(manifest["training_columns"]["action"], "actions")
+            self.assertEqual(manifest["camera_keys"], ["observation.images.cam_head"])
+            self.assertEqual(manifest["camera_columns"], ["observation_images_cam_head"])
+            self.assertEqual(manifest["state_dim"], 3)
+            self.assertEqual(manifest["action_dim"], 3)
+
+            frames = lance.dataset(str(target / "frames.lance"))
+            frame = frames.scanner(
+                columns=[
+                    "global_frame_index",
+                    "state_norm",
+                    "action_norm",
+                    "is_bad_frame",
+                ],
+                limit=1,
+            ).to_table().to_pylist()[0]
+            self.assertEqual(frame["global_frame_index"], 0)
+            self.assertFalse(frame["is_bad_frame"])
+
+            media = lance.dataset(str(target / "media.lance"))
+            media_row = media.scanner(
+                columns=[
+                    "camera_name",
+                    "camera_key",
+                    "media_type",
+                    "relative_path",
+                    "num_frames",
+                    "width_pixels",
+                    "height_pixels",
+                ],
+                limit=1,
+            ).to_table().to_pylist()[0]
+            self.assertEqual(media_row["camera_name"], "observation.images.cam_head")
+            self.assertEqual(media_row["camera_key"], "observation.images.cam_head")
+            self.assertEqual(media_row["media_type"], "video")
+            self.assertEqual(media_row["num_frames"], 4)
+            self.assertEqual(media_row["width_pixels"], 320)
+            self.assertEqual(media_row["height_pixels"], 240)
 
     def test_refuses_existing_target_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
