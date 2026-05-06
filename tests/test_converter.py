@@ -160,6 +160,10 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["format"], "rllab_lance_session_v1")
             self.assertEqual(manifest["primary_training_table"], "episodes.lance")
+            self.assertEqual(manifest["training_row_unit"], "episode")
+            self.assertEqual(manifest["training_index_column"], "episode_index")
+            self.assertIsNone(manifest["source_episode_column"])
+            self.assertIsNone(manifest["video_frame_offset_column"])
             self.assertEqual(manifest["training_columns"]["state"], "observation_state")
             self.assertEqual(manifest["training_columns"]["action"], "actions")
             self.assertEqual(manifest["camera_keys"], ["observation.images.cam_head"])
@@ -184,9 +188,11 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             media_row = media.scanner(
                 columns=[
                     "camera_name",
-                    "camera_key",
                     "media_type",
                     "relative_path",
+                    "video_path",
+                    "from_timestamp",
+                    "to_timestamp",
                     "num_frames",
                     "width_pixels",
                     "height_pixels",
@@ -194,8 +200,10 @@ class LerobotToLanceConversionTest(unittest.TestCase):
                 limit=1,
             ).to_table().to_pylist()[0]
             self.assertEqual(media_row["camera_name"], "observation.images.cam_head")
-            self.assertEqual(media_row["camera_key"], "observation.images.cam_head")
             self.assertEqual(media_row["media_type"], "video")
+            self.assertIsNone(media_row["video_path"])
+            self.assertEqual(media_row["from_timestamp"], 0.0)
+            self.assertAlmostEqual(media_row["to_timestamp"], 0.1)
             self.assertEqual(media_row["num_frames"], 4)
             self.assertEqual(media_row["width_pixels"], 320)
             self.assertEqual(media_row["height_pixels"], 240)

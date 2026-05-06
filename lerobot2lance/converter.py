@@ -251,6 +251,7 @@ def convert_lerobot_to_lance(
         action_dim=_nested_dim(actions),
         episodes_written=len(episode_rows),
         frames_written=len(frame_rows) if include_frames else 0,
+        media_written=len(media_rows),
     )
 
     return {
@@ -502,11 +503,12 @@ def _media_row(
         "episode_index": episode_index,
         "camera_id": camera_norm,
         "camera_name": camera_key,
-        "camera_key": camera_key,
         "media_type": "video",
         "uri": rel,
         "relative_path": rel,
-        "filename": video_path.name,
+        "video_path": None,
+        "from_timestamp": 0.0,
+        "to_timestamp": (num_frames - 1) / fps if num_frames > 0 else None,
         "sha256": hashlib.sha256(blob).hexdigest(),
         "byte_size": len(blob),
         "num_frames": int(num_frames),
@@ -534,6 +536,7 @@ def _write_manifest(
     action_dim: int,
     episodes_written: int,
     frames_written: int,
+    media_written: int,
 ) -> None:
     tables = {
         "episodes": "episodes.lance",
@@ -550,6 +553,10 @@ def _write_manifest(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": str(source),
         "primary_training_table": "episodes.lance",
+        "training_row_unit": "episode",
+        "training_index_column": "episode_index",
+        "source_episode_column": None,
+        "video_frame_offset_column": None,
         "frame_table": "frames.lance" if include_frames else None,
         "media_table": "media.lance" if has_media else None,
         "state_column": "observation_state",
@@ -564,10 +571,15 @@ def _write_manifest(
         "state_dim": int(state_dim),
         "action_dim": int(action_dim),
         "media_mode": "episode_blob",
+        "blob_storage": {
+            "episodes": "video_blob_columns",
+            "media": "video_blob_column" if has_media else "absent",
+        },
         "tables": tables,
         "counts": {
             "episodes": int(episodes_written),
             "frames": int(frames_written),
+            "media": int(media_written),
         },
     }
     text = json.dumps(manifest, indent=2, sort_keys=True)
@@ -644,29 +656,30 @@ def _build_frames_schema(pa: Any) -> Any:
 def _build_media_schema(pa: Any) -> Any:
     return pa.schema(
         [
-            pa.field("media_id", pa.string(), nullable=False),
+            pa.field("media_id", pa.string()),
             pa.field("episode_id", pa.string()),
-            pa.field("episode_index", pa.int64(), nullable=False),
+            pa.field("episode_index", pa.int64()),
             pa.field("camera_id", pa.string()),
-            pa.field("camera_name", pa.string()),
-            pa.field("camera_key", pa.string()),
+            pa.field("camera_name", pa.string(), nullable=False),
             pa.field("media_type", pa.string()),
             pa.field("uri", pa.string()),
             pa.field("relative_path", pa.string()),
-            pa.field("filename", pa.string()),
-            pa.field("sha256", pa.string()),
-            pa.field("byte_size", pa.int64()),
-            pa.field("num_frames", pa.int64()),
-            pa.field("fps", pa.float64()),
-            pa.field("width_pixels", pa.int32()),
-            pa.field("height_pixels", pa.int32()),
-            pa.field("codec", pa.string()),
-            pa.field("chunk_index", pa.int64()),
-            pa.field("file_index", pa.int64()),
             pa.field(
                 "video_blob",
                 pa.large_binary(),
                 metadata={b"lance-encoding:blob": b"true"},
             ),
+            pa.field("video_path", pa.string()),
+            pa.field("from_timestamp", pa.float64()),
+            pa.field("to_timestamp", pa.float64()),
+            pa.field("num_frames", pa.int64()),
+            pa.field("chunk_index", pa.int64()),
+            pa.field("file_index", pa.int64()),
+            pa.field("sha256", pa.string()),
+            pa.field("byte_size", pa.int64()),
+            pa.field("width_pixels", pa.int64()),
+            pa.field("height_pixels", pa.int64()),
+            pa.field("fps", pa.float64()),
+            pa.field("codec", pa.string()),
         ]
     )

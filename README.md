@@ -97,9 +97,55 @@ Camera-name normalization: `observation.images.cam_head` → `observation_images
 
 `frames.lance` also includes `global_frame_index`, `state_norm`, `action_norm`, and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic statistics.
 
-`media.lance` is the canonical media table. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `camera_key`, `media_type`, `relative_path`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, `codec`, and `video_blob`.
+`media.lance` is the canonical media table. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `uri`, `relative_path`, `video_blob`, `video_path`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`.
 
-`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. This lets `rllab-training`, `robo_dataview`, and the stack scripts share one contract without extra CLI flags.
+`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `training_row_unit="episode"`, `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. This lets `rllab-training`, `robo_dataview`, and the stack scripts share one contract without extra CLI flags.
+
+## 한국어 사용법
+
+### 설치
+
+```bash
+cd /home/shkim_rllab/Desktop/lerobot2lance
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+### 변환
+
+```bash
+lerobot2lance \
+  --source /path/to/lerobot_dataset \
+  --target /path/to/output_lance_session \
+  --overwrite
+```
+
+변환 결과는 현재 RLLAB/Dataview Lance 구조에 맞는 raw training session입니다.
+
+```text
+output_lance_session/
+  manifest.json
+  episodes.lance/   # raw episode training table, row 하나 = episode 하나
+  frames.lance/     # frame-level QA/search table
+  media.lance/      # canonical media table
+  meta/info.json
+```
+
+`episodes.lance`가 기본 학습 테이블입니다. Dataview에서 skill clip을 자르고 export하면, 그 curated export 쪽에서 `train_skill_clips.lance`가 생성됩니다. `lerobot2lance`는 LeRobot raw dataset을 raw Lance session으로 바꾸는 도구라서 `skills.lance`나 `train_skill_clips.lance`를 만들지 않습니다.
+
+### 확인
+
+```bash
+pytest -q
+```
+
+스택에서 사용할 때는 변환된 target 디렉터리를 그대로 Dataview나 training에 넘기면 됩니다.
+
+```bash
+./scripts/view.sh /path/to/output_lance_session
+./scripts/train_policy.sh /path/to/output_lance_session
+```
 
 ## Examples
 
