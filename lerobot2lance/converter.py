@@ -549,6 +549,7 @@ def _write_manifest(
 
     manifest = {
         "format": "rllab_lance_session_v1",
+        "schema_version": "1.0",
         "source_format": f"lerobot_{layout}",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": str(source),
