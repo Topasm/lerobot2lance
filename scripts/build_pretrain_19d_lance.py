@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import shutil
@@ -121,6 +122,7 @@ def main() -> int:
                 n,
                 sid,
                 emap,
+                source_camera_columns,
             ),
             copy_blobs=False,
         )
@@ -219,11 +221,13 @@ def main() -> int:
     write_json(output / "meta" / "sessions.json", sessions)
     write_json(output / "meta" / "sources.json", source_rows)
     write_json(output / "meta" / "info.json", build_info(args.dataset_id, manifest, source_rows))
-    write_json(output / "meta" / "tasks.json", build_tasks(output / "data" / "episodes.lance"))
-    write_json(
-        output / "meta" / "stats.json",
-        compute_lerobot_stats(output / "data" / "train_episodes.lance"),
-    )
+    tasks_payload = build_tasks(output / "data" / "episodes.lance")
+    stats_payload = compute_lerobot_stats(output / "data" / "train_episodes.lance")
+    write_json(output / "meta" / "tasks.json", tasks_payload)
+    write_tasks_jsonl(output / "meta" / "tasks.jsonl", tasks_payload)
+    write_episodes_jsonl(output / "meta" / "episodes.jsonl", output / "data" / "episodes.lance")
+    write_json(output / "meta" / "splits.json", build_splits(episode_offset))
+    write_stats_sidecars(output / "meta", stats_payload)
     (output / "README.md").write_text(render_readme(args.dataset_id, manifest, sessions), encoding="utf-8")
 
     print(f"wrote {output}", flush=True)
@@ -358,6 +362,91 @@ def compute_lerobot_stats(table_path: Path) -> dict[str, Any]:
     }
 
 
+def write_stats_sidecars(meta_dir: Path, stats: dict[str, Any]) -> None:
+    write_json(meta_dir / "stats.json", stats)
+    stats_dir = meta_dir / "stats"
+    write_json(
+        stats_dir / "state_body.json",
+        {
+            "schema_version": "1.0",
+            "modality": "state.body",
+            "feature": "observation.state",
+            **stats.get("observation.state", {}),
+        },
+    )
+    write_json(
+        stats_dir / "action_body.json",
+        {
+            "schema_version": "1.0",
+            "action": "action.body",
+            "feature": "action",
+            **stats.get("action", {}),
+        },
+    )
+
+
+def write_tasks_jsonl(path: Path, tasks_payload: dict[str, Any]) -> None:
+    lines = [
+        json.dumps(
+            {
+                "task_index": row["task_index"],
+                "task": row.get("language_instruction"),
+                "language_instruction": row.get("language_instruction"),
+                "episode_count": row.get("episode_count", 0),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for row in tasks_payload.get("tasks", [])
+    ]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def write_episodes_jsonl(path: Path, episodes_path: Path) -> None:
+    import lance
+
+    ds = lance.dataset(str(episodes_path))
+    lines = []
+    for row in scan_rows(
+        ds,
+        columns=["episode_index", "task_index", "language_instruction", "length"],
+    ):
+        language = row.get("language_instruction")
+        lines.append(
+            json.dumps(
+                {
+                    "episode_index": as_int(row.get("episode_index")) or 0,
+                    "task_index": as_int(row.get("task_index")) or 0,
+                    "tasks": [language] if language else [],
+                    "length": as_int(row.get("length")) or 0,
+                    "split": split_for_episode(as_int(row.get("episode_index")) or 0, ds.count_rows()),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def build_splits(episode_count: int) -> dict[str, Any]:
+    splits: dict[str, list[int]] = {"train": [], "val": [], "test": []}
+    for episode_index in range(episode_count):
+        splits[split_for_episode(episode_index, episode_count)].append(episode_index)
+    return {
+        "schema_version": "1.0",
+        "strategy": "deterministic_90_10_0_by_episode_index",
+        "ratios": {"train": 0.9, "val": 0.1, "test": 0.0},
+        "splits": {key: value for key, value in splits.items() if value},
+    }
+
+
+def split_for_episode(episode_index: int, episode_count: int) -> str:
+    if episode_count < 10:
+        return "train"
+    train_count = int(math.floor(episode_count * 0.9))
+    return "train" if episode_index < train_count else "val"
+
+
 def build_episode_map(episodes_path: Path, episode_offset: int) -> dict[int, int]:
     import lance
 
@@ -459,17 +548,30 @@ def transform_episode_metadata(
     source: dict[str, Any],
     source_id: int,
     episode_map: dict[int, int],
+    camera_columns: list[str],
 ) -> dict[str, Any]:
     source_episode = int(row["episode_index"])
+    episode_index = episode_map[source_episode]
+    timestamps = row.get("timestamps") or []
+    states = row.get("observation_state") or []
+    actions = row.get("actions") or []
     return {
-        "episode_index": episode_map[source_episode],
+        "episode_index": episode_index,
         "task_index": as_int(row.get("task_index")) or 0,
         "fps": as_float(row.get("fps")),
         "length": as_int(row.get("length")) or 0,
-        "timestamps": row.get("timestamps") or [],
-        "observation_state": row.get("observation_state") or [],
-        "actions": row.get("actions") or [],
+        "timestamps": timestamps,
+        "observation_state": states,
+        "actions": actions,
         "language_instruction": row.get("language_instruction"),
+        "camera_segments": camera_segments_for_row(
+            row,
+            source_id=source_id,
+            episode_index=episode_index,
+            camera_columns=camera_columns,
+        ),
+        "task_segments": task_segments_for_row(row, timestamps=timestamps),
+        "trajectory_sha256": trajectory_sha256(timestamps, states, actions),
         "source_id": source_id,
         "source_dataset": source.get("source_repo_id"),
         "source_repo_id": source.get("source_repo_id"),
@@ -491,15 +593,27 @@ def transform_train_episode(
     camera_columns: list[str],
 ) -> dict[str, Any]:
     source_episode = int(row["episode_index"])
+    episode_index = episode_map[source_episode]
+    timestamps = row.get("timestamps") or []
+    states = row.get("observation_state") or []
+    actions = row.get("actions") or []
     out = {
-        "episode_index": episode_map[source_episode],
+        "episode_index": episode_index,
         "task_index": as_int(row.get("task_index")) or 0,
         "fps": as_float(row.get("fps")),
         "length": as_int(row.get("length")) or 0,
-        "timestamps": row.get("timestamps") or [],
-        "observation_state": row.get("observation_state") or [],
-        "actions": row.get("actions") or [],
+        "timestamps": timestamps,
+        "observation_state": states,
+        "actions": actions,
         "language_instruction": row.get("language_instruction"),
+        "camera_segments": camera_segments_for_row(
+            row,
+            source_id=source_id,
+            episode_index=episode_index,
+            camera_columns=camera_columns,
+        ),
+        "task_segments": task_segments_for_row(row, timestamps=timestamps),
+        "trajectory_sha256": trajectory_sha256(timestamps, states, actions),
         "source_id": source_id,
         "source_dataset": source.get("source_repo_id"),
         "source_repo_id": source.get("source_repo_id"),
@@ -550,6 +664,88 @@ def transform_frame(
     }
 
 
+def target_media_id(source_id: int, episode_index: int, camera_id: Any) -> str:
+    return f"source_{source_id:05d}_episode_{episode_index:08d}_{camera_id or ''}"
+
+
+def camera_segments_for_row(
+    row: dict[str, Any],
+    *,
+    source_id: int,
+    episode_index: int,
+    camera_columns: list[str],
+) -> list[dict[str, Any]]:
+    if isinstance(row.get("camera_segments"), list) and row["camera_segments"]:
+        segments: list[dict[str, Any]] = []
+        for segment in row["camera_segments"]:
+            camera_column = segment.get("camera_column") or segment.get("camera_id")
+            if camera_column not in camera_columns:
+                continue
+            segments.append(
+                {
+                    **segment,
+                    "media_id": target_media_id(source_id, episode_index, camera_column),
+                }
+            )
+        if segments:
+            return segments
+
+    out: list[dict[str, Any]] = []
+    fps = as_float(row.get("fps")) or 0.0
+    length = as_int(row.get("length")) or 0
+    for camera_column in camera_columns:
+        from_ts = row.get(f"{camera_column}_from_timestamp")
+        to_ts = row.get(f"{camera_column}_to_timestamp")
+        if from_ts is None and to_ts is None:
+            continue
+        out.append(
+            {
+                "camera_key": camera_column,
+                "camera_column": camera_column,
+                "media_id": target_media_id(source_id, episode_index, camera_column),
+                "from_timestamp": as_float(from_ts),
+                "to_timestamp": as_float(to_ts)
+                if to_ts is not None
+                else ((length - 1) / fps if fps > 0 and length else None),
+                "frame_start": 0,
+                "frame_count": length,
+            }
+        )
+    return out
+
+
+def task_segments_for_row(row: dict[str, Any], *, timestamps: list[Any]) -> list[dict[str, Any]]:
+    if isinstance(row.get("task_segments"), list) and row["task_segments"]:
+        return row["task_segments"]
+    length = as_int(row.get("length")) or len(timestamps)
+    if length <= 0:
+        return []
+    return [
+        {
+            "task_index": as_int(row.get("task_index")) or 0,
+            "language_instruction": row.get("language_instruction"),
+            "start_frame": 0,
+            "end_frame": length - 1,
+            "start_timestamp": as_float(timestamps[0]) if timestamps else None,
+            "end_timestamp": as_float(timestamps[-1]) if timestamps else None,
+        }
+    ]
+
+
+def trajectory_sha256(
+    timestamps: list[Any],
+    states: list[Any],
+    actions: list[Any],
+) -> str:
+    payload = {
+        "timestamps": timestamps,
+        "observation_state": states,
+        "actions": actions,
+    }
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def transform_video(
     row: dict[str, Any],
     source: dict[str, Any],
@@ -559,13 +755,21 @@ def transform_video(
     source_episode = int(row["episode_index"])
     episode_index = episode_map[source_episode]
     camera_id = row.get("camera_id") or ""
+    source_struct = row.get("source") if isinstance(row.get("source"), dict) else {}
     return {
-        "media_id": f"source_{source_id:05d}_episode_{episode_index:08d}_{camera_id}",
+        "media_id": target_media_id(source_id, episode_index, camera_id),
         "episode_id": f"episode_{episode_index:08d}",
         "episode_index": episode_index,
         "camera_id": camera_id,
         "camera_name": row.get("camera_name"),
         "media_type": row.get("media_type"),
+        "source": {
+            "uri": source_struct.get("uri") or row.get("source_uri") or row.get("uri"),
+            "repo_id": source.get("source_repo_id"),
+            "dataset_url": hf_dataset_url(source.get("source_repo_id")),
+            "media_id": row.get("media_id"),
+            "relative_path": row.get("source_relative_path") or row.get("relative_path"),
+        },
         "source_uri": row.get("source_uri") or row.get("uri"),
         "uri": row.get("uri"),
         "relative_path": row.get("relative_path"),
@@ -609,8 +813,47 @@ def build_episodes_schema(pa: Any) -> Any:
             pa.field("observation_state", pa.list_(pa.list_(pa.float32()))),
             pa.field("actions", pa.list_(pa.list_(pa.float32()))),
             pa.field("language_instruction", pa.string()),
+            segment_fields(pa)[0],
+            segment_fields(pa)[1],
+            pa.field("trajectory_sha256", pa.string()),
             *source_fields(pa),
         ]
+    )
+
+
+def segment_fields(pa: Any) -> tuple[Any, Any]:
+    return (
+        pa.field(
+            "camera_segments",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("camera_key", pa.string()),
+                        pa.field("camera_column", pa.string()),
+                        pa.field("media_id", pa.string()),
+                        pa.field("from_timestamp", pa.float64()),
+                        pa.field("to_timestamp", pa.float64()),
+                        pa.field("frame_start", pa.int64()),
+                        pa.field("frame_count", pa.int64()),
+                    ]
+                )
+            ),
+        ),
+        pa.field(
+            "task_segments",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("task_index", pa.int64()),
+                        pa.field("language_instruction", pa.string()),
+                        pa.field("start_frame", pa.int64()),
+                        pa.field("end_frame", pa.int64()),
+                        pa.field("start_timestamp", pa.float64()),
+                        pa.field("end_timestamp", pa.float64()),
+                    ]
+                )
+            ),
+        ),
     )
 
 
@@ -624,6 +867,9 @@ def build_train_episodes_schema(pa: Any, camera_columns: list[str]) -> Any:
         pa.field("observation_state", pa.list_(pa.list_(pa.float32()))),
         pa.field("actions", pa.list_(pa.list_(pa.float32()))),
         pa.field("language_instruction", pa.string()),
+        segment_fields(pa)[0],
+        segment_fields(pa)[1],
+        pa.field("trajectory_sha256", pa.string()),
     ]
     for camera_column in camera_columns:
         fields.extend(
@@ -668,6 +914,18 @@ def build_videos_schema(pa: Any) -> Any:
             pa.field("camera_id", pa.string()),
             pa.field("camera_name", pa.string()),
             pa.field("media_type", pa.string()),
+            pa.field(
+                "source",
+                pa.struct(
+                    [
+                        pa.field("uri", pa.string()),
+                        pa.field("repo_id", pa.string()),
+                        pa.field("dataset_url", pa.string()),
+                        pa.field("media_id", pa.string()),
+                        pa.field("relative_path", pa.string()),
+                    ]
+                ),
+            ),
             pa.field("source_uri", pa.string()),
             pa.field("uri", pa.string()),
             pa.field("relative_path", pa.string()),
@@ -738,6 +996,7 @@ def build_manifest(
 ) -> dict[str, Any]:
     fps_values = sorted({float(source["fps"]) for source in sources if source.get("fps") is not None})
     primary_fps = 10.0 if 10.0 in fps_values else (fps_values[0] if fps_values else None)
+    fps_for_registry = float(primary_fps or 0.0)
     return {
         "format": PUBLISHED_FORMAT,
         "schema_version": "1.0",
@@ -782,6 +1041,8 @@ def build_manifest(
         "camera_keys": camera_keys,
         "camera_columns": camera_columns,
         "camera_key_to_column": dict(zip(camera_keys, camera_columns)),
+        "modalities": build_modalities(camera_keys, camera_columns, fps_for_registry),
+        "actions": build_actions(fps_for_registry),
         "fps": primary_fps,
         "fps_values": fps_values,
         "fps_mode": "single" if len(fps_values) <= 1 else "mixed",
@@ -789,6 +1050,39 @@ def build_manifest(
         "action_dim": 19,
         "source_camera_keys": source_camera_keys,
         "source_camera_columns": source_camera_columns,
+        "rates": {
+            "fps": primary_fps,
+            "fps_values": fps_values,
+            "modalities": {
+                "state.body": primary_fps,
+                **{video_modality_key(key): primary_fps for key in camera_keys},
+            },
+            "actions": {"action.body": primary_fps},
+        },
+        "capabilities": {
+            "inline_video_blobs": bool(videos),
+            "videos_table": bool(videos),
+            "frames_table": bool(frames),
+            "camera_segments": True,
+            "task_segments": True,
+            "trajectory_sha256": True,
+            "per_modality_stats": True,
+        },
+        "reader_hints": {
+            "prefer_registry": True,
+            "video_lookup": "videos.media_id",
+            "normalization": "meta/stats.json",
+            "per_modality_stats_dir": "meta/stats",
+            "legacy_aliases_available": True,
+        },
+        "indexes": {
+            "created": [],
+            "recommended": [
+                {"table": "data/train_episodes.lance", "columns": ["episode_index"]},
+                {"table": "data/frames.lance", "columns": ["episode_index", "frame_index"]},
+                {"table": "data/videos.lance", "columns": ["media_id", "episode_index", "camera_id"]},
+            ],
+        },
         "media_mode": "videos_table",
         "camera_storage": "videos_table",
         "training_ready": True,
@@ -808,7 +1102,13 @@ def build_manifest(
         "meta": {
             "info": "meta/info.json",
             "stats": "meta/stats.json",
+            "stats_dir": "meta/stats",
+            "state_body_stats": "meta/stats/state_body.json",
+            "action_body_stats": "meta/stats/action_body.json",
             "tasks": "meta/tasks.json",
+            "tasks_jsonl": "meta/tasks.jsonl",
+            "episodes_jsonl": "meta/episodes.jsonl",
+            "splits": "meta/splits.json",
             "sessions": "meta/sessions.json",
             "sources": "meta/sources.json",
         },
@@ -854,12 +1154,74 @@ def build_manifest(
                 "pretrain_tier",
             ],
             "media_reference_columns": [
+                "source_uri",
                 "source_local_path",
                 "source_video_table",
                 "source_media_id",
                 "source_relative_path",
             ],
         },
+    }
+
+
+def video_modality_key(camera_key: str) -> str:
+    if camera_key.startswith("observation.images."):
+        return f"video.{camera_key.removeprefix('observation.images.')}"
+    return f"video.{camera_key}"
+
+
+def build_modalities(camera_keys: list[str], camera_columns: list[str], fps: float) -> dict[str, Any]:
+    modalities: dict[str, Any] = {
+        "state.body": {
+            "kind": "state",
+            "source_key": "observation.state",
+            "table": "train_episodes",
+            "path": "data/train_episodes.lance",
+            "column": "observation_state",
+            "frame_table": "frames",
+            "frame_path": "data/frames.lance",
+            "frame_column": "observation_state",
+            "names_ref": "meta/info.json#/features/observation.state/names",
+            "shape": [19],
+            "rate_hz": fps,
+            "stats": "meta/stats/state_body.json",
+        }
+    }
+    for camera_key, camera_column in zip(camera_keys, camera_columns):
+        modalities[video_modality_key(camera_key)] = {
+            "kind": "video",
+            "source_key": camera_key,
+            "camera_key": camera_key,
+            "camera_column": camera_column,
+            "table": "videos",
+            "path": "data/videos.lance",
+            "media_id_column": "media_id",
+            "blob_column": "video_blob",
+            "segment_column": "camera_segments",
+            "names_ref": f"meta/info.json#/features/{camera_key}/names",
+            "shape_ref": f"meta/info.json#/features/{camera_key}/shape",
+            "rate_hz": fps,
+        }
+    return modalities
+
+
+def build_actions(fps: float) -> dict[str, Any]:
+    return {
+        "action.body": {
+            "kind": "action",
+            "source_key": "action",
+            "table": "train_episodes",
+            "path": "data/train_episodes.lance",
+            "column": "actions",
+            "frame_table": "frames",
+            "frame_path": "data/frames.lance",
+            "frame_column": "action",
+            "names_ref": "meta/info.json#/features/action/names",
+            "shape": [19],
+            "rate_hz": fps,
+            "stats": "meta/stats/action_body.json",
+            "alignment": "same_frame_timestamp",
+        }
     }
 
 

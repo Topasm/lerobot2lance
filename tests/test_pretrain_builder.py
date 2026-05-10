@@ -228,6 +228,9 @@ class PretrainBuilderTest(unittest.TestCase):
                 self.assertEqual(manifest["frame_columns"]["state"], "observation_state")
                 self.assertEqual(manifest["frame_columns"]["action"], "action")
                 self.assertEqual(manifest["state_action_alignment"]["type"], "same_frame_timestamp")
+                self.assertIn("state.body", manifest["modalities"])
+                self.assertIn("action.body", manifest["actions"])
+                self.assertTrue(manifest["capabilities"]["camera_segments"])
                 self.assertEqual(manifest["blob_storage"]["episodes"], "absent")
                 self.assertEqual(manifest["blob_storage"]["train_episodes"], "absent")
                 self.assertEqual(manifest["blob_storage"]["videos"], "video_blob_column")
@@ -236,6 +239,9 @@ class PretrainBuilderTest(unittest.TestCase):
                 self.assertEqual(manifest["counts"]["videos"], 2)
                 self.assertNotIn("media", manifest["counts"])
                 self.assertEqual(manifest["meta"]["stats"], "meta/stats.json")
+                self.assertEqual(manifest["meta"]["tasks_jsonl"], "meta/tasks.jsonl")
+                self.assertEqual(manifest["meta"]["episodes_jsonl"], "meta/episodes.jsonl")
+                self.assertEqual(manifest["meta"]["splits"], "meta/splits.json")
                 self.assertEqual(manifest["stats"]["source_table"], "data/train_episodes.lance")
                 self.assertEqual(
                     manifest["camera_keys"],
@@ -257,6 +263,12 @@ class PretrainBuilderTest(unittest.TestCase):
                 self.assertFalse(
                     any(name.endswith("_video_blob") for name in episodes.schema.names)
                 )
+                episode = episodes.scanner(
+                    columns=["camera_segments", "task_segments", "trajectory_sha256"],
+                    limit=1,
+                ).to_table().to_pylist()[0]
+                self.assertEqual(episode["task_segments"][0]["task_index"], 0)
+                self.assertEqual(len(episode["trajectory_sha256"]), 64)
 
                 train_episodes = lance.dataset(str(out / "data" / "train_episodes.lance"))
                 self.assertEqual(train_episodes.count_rows(), 2)
@@ -285,6 +297,10 @@ class PretrainBuilderTest(unittest.TestCase):
                 stats = json.loads((out / "meta" / "stats.json").read_text())
                 self.assertEqual(stats["observation.state"]["count"], [4] * 19)
                 self.assertEqual(stats["action"]["count"], [4] * 19)
+                self.assertTrue((out / "meta" / "stats" / "state_body.json").exists())
+                self.assertTrue((out / "meta" / "tasks.jsonl").exists())
+                self.assertTrue((out / "meta" / "episodes.jsonl").exists())
+                self.assertTrue((out / "meta" / "splits.json").exists())
                 tasks = json.loads((out / "meta" / "tasks.json").read_text())
                 self.assertEqual(tasks["tasks"][0]["language_instruction"], "pick")
 

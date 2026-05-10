@@ -9,6 +9,9 @@ The two LeRobot disk layouts are auto-detected:
 
 Output is identical for both, so downstream code only ever has to deal with one shape.
 
+The published bundle format is fixed by [`docs/STANDARD.md`](docs/STANDARD.md) —
+that document is the contract; the README below is a usage walkthrough.
+
 ## Install
 
 ```bash
@@ -103,7 +106,13 @@ target/
   meta/
     info.json             # copy of the source LeRobot info.json (used by viewers for codec metadata)
     stats.json            # LeRobot-compatible observation.state/action normalization stats
+    stats/
+      state_body.json     # per-modality stats for manifest.modalities["state.body"]
+      action_body.json    # per-action stats for manifest.actions["action.body"]
     tasks.json            # task_index -> language_instruction summary
+    tasks.jsonl           # LeRobot-style canonical task sidecar
+    episodes.jsonl        # lightweight episode metadata sidecar
+    splits.json           # train/val/test episode lists
     sessions.json         # provenance for this converted source dataset
   data/
     episodes.lance        # primary trajectory table, no *_video_blob columns
@@ -126,7 +135,13 @@ target/
   meta/
     info.json             # copy of source LeRobot info.json
     stats.json            # LeRobot-compatible state/action normalization stats
+    stats/
+      state_body.json
+      action_body.json
     tasks.json            # task_index -> language_instruction summary
+    tasks.jsonl
+    episodes.jsonl
+    splits.json
 ```
 
 `episodes.lance` columns:
@@ -141,6 +156,9 @@ target/
 | `observation_state` | list&lt;list&lt;float32&gt;&gt; | shape (T, state_dim) |
 | `actions` | list&lt;list&lt;float32&gt;&gt; | shape (T, action_dim) |
 | `language_instruction` | string | from `meta/tasks.jsonl` lookup |
+| `camera_segments` | list&lt;struct&gt; | camera key/column, `media_id`, timestamp range, frame range |
+| `task_segments` | list&lt;struct&gt; | task index/instruction and frame/timestamp span |
+| `trajectory_sha256` | string | hash of timestamps + state/action arrays |
 | `{camera_norm}_from_timestamp` | float64 | always `0.0` for whole-episode segments |
 | `{camera_norm}_to_timestamp` | float64 | `(length - 1) / fps` |
 
@@ -155,7 +173,7 @@ The converter does not shift actions to the next state; this is recorded in
 
 The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) is the only place video bytes are stored. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `relative_path`, `source_uri`, `source_dataset_url`, `video_blob`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`. `uri` and `video_path` are kept only as compatibility aliases; new readers should use `relative_path` and `source_uri`.
 
-`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `media_mode="videos_table"`, `training_columns`, `frame_columns`, `state_action_alignment`, `camera_keys`, `camera_columns`, `camera_key_to_column`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. The canonical row counts live under `counts.{episodes,frames,videos}`; older `total_*` fields remain as compatibility aliases. `rllab-training`, `robo_dataview`, and the stack scripts resolve camera MP4s through the media table, so there is no second training-only video format.
+`manifest.json` names the `primary_training_table` (`episodes.lance` for a direct conversion, `train_episodes.lance` for a merged pretrain bundle), records `media_mode="videos_table"`, `training_columns`, `frame_columns`, `state_action_alignment`, `modalities`, `actions`, `camera_keys`, `camera_columns`, `camera_key_to_column`, `rates`, `capabilities`, `reader_hints`, `indexes`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. The canonical row counts live under `counts.{episodes,frames,videos}`; older `total_*` fields remain as compatibility aliases. `rllab-training`, `robo_dataview`, and the stack scripts resolve camera MP4s through the media table, so there is no second training-only video format.
 
 ## 한국어 사용법
 
@@ -309,7 +327,12 @@ data/pretrain_aiworker_19d/
   data/frames.lance
   data/videos.lance
   meta/stats.json
+  meta/stats/state_body.json
+  meta/stats/action_body.json
   meta/tasks.json
+  meta/tasks.jsonl
+  meta/episodes.jsonl
+  meta/splits.json
   meta/sessions.json
   meta/sources.json
 ```

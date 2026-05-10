@@ -31,6 +31,22 @@ RLLAB_SESSION_FORMAT = "rllab_lance_session_v1"
 RLLAB_PUBLISHED_FORMAT = "rllab_published_lance_dataset_v1"
 RLLAB_PUBLISHED_LAYOUT = "rllab_published_dataset_v1"
 
+# Keep a single videos.lance fragment under HF LFS object limits so very large
+# bundles stay pushable. 2 GB is well under HF's per-object cap and gives good
+# parallel-download granularity.
+VIDEOS_MAX_BYTES_PER_FILE = 2 * 1024 * 1024 * 1024
+VIDEOS_MAX_ROWS_PER_FILE = 4096
+
+# episodes.lance / frames.lance are numeric-only; cap rows per file so very long
+# pretrain merges still shard cleanly.
+TRAJ_MAX_ROWS_PER_FILE = 100_000
+
+SCALAR_INDEX_COLUMNS = {
+    "episodes": ["episode_index", "task_index"],
+    "frames": ["episode_index", "frame_index", "task_index"],
+    "videos": ["episode_index", "camera_id", "media_id"],
+}
+
 CONVERSION_REPORT_KEYS = (
     "source",
     "target",
@@ -117,6 +133,7 @@ def convert_lerobot_to_lance(
     media_rows: list[dict[str, Any]] = []
     seen_video_paths: set[str] = set()
     source_repo_id = _source_repo_id(info, source)
+    split_by_episode: dict[int, str] = {}
 
     total = len(episode_meta_rows)
     for ordinal, meta_row in enumerate(episode_meta_rows):
@@ -155,6 +172,14 @@ def convert_lerobot_to_lance(
         if not language and episode_task_index is not None:
             language = _task_text_for_index(task_lookup, episode_task_index)
 
+        task_segments = _task_segments_from_frames(
+            ep_frames,
+            timestamps=timestamps,
+            default_task_index=episode_task_index if episode_task_index is not None else 0,
+            default_language=language,
+            task_lookup=task_lookup,
+        )
+        split_by_episode[episode_index] = str(meta_row.get("split") or "train")
         episode_row: dict[str, Any] = {
             "episode_index": episode_index,
             "task_index": episode_task_index if episode_task_index is not None else 0,
@@ -164,6 +189,9 @@ def convert_lerobot_to_lance(
             "observation_state": states,
             "actions": actions,
             "language_instruction": language,
+            "camera_segments": [],
+            "task_segments": task_segments,
+            "trajectory_sha256": _trajectory_sha256(timestamps, states, actions),
         }
 
         if include_frames:
@@ -211,6 +239,16 @@ def convert_lerobot_to_lance(
             blob = video_path.read_bytes()
             episode_row[f"{camera_norm}_from_timestamp"] = 0.0
             episode_row[f"{camera_norm}_to_timestamp"] = (len(ep_frames) - 1) / fps
+            media_id = _media_id(episode_index, camera_norm)
+            episode_row["camera_segments"].append(
+                _camera_segment(
+                    camera_key=camera_key,
+                    camera_norm=camera_norm,
+                    media_id=media_id,
+                    num_frames=len(ep_frames),
+                    fps=fps,
+                )
+            )
 
             video_key = str(video_path.resolve())
             if video_key not in seen_video_paths:
@@ -243,25 +281,48 @@ def convert_lerobot_to_lance(
                 },
             )
 
+    indexes_built: dict[str, list[str]] = {}
+
     episodes_schema = _build_episodes_schema(pa, cameras_norm)
     episodes_table = pa.Table.from_pylist(episode_rows, schema=episodes_schema)
-    lance.write_dataset(episodes_table, str(table_root / "episodes.lance"), mode="overwrite")
+    indexes_built["episodes"] = _write_lance_table(
+        lance,
+        episodes_table,
+        table_root / "episodes.lance",
+        max_rows_per_file=TRAJ_MAX_ROWS_PER_FILE,
+        scalar_indexes=SCALAR_INDEX_COLUMNS["episodes"],
+    )
 
     if include_frames and frame_rows:
         frames_schema = _build_frames_schema(pa)
         frames_table = pa.Table.from_pylist(frame_rows, schema=frames_schema)
-        lance.write_dataset(frames_table, str(table_root / "frames.lance"), mode="overwrite")
+        indexes_built["frames"] = _write_lance_table(
+            lance,
+            frames_table,
+            table_root / "frames.lance",
+            max_rows_per_file=TRAJ_MAX_ROWS_PER_FILE,
+            scalar_indexes=SCALAR_INDEX_COLUMNS["frames"],
+        )
 
     if media_rows:
         media_schema = _build_media_schema(pa)
         media_table = pa.Table.from_pylist(media_rows, schema=media_schema)
-        lance.write_dataset(media_table, str(table_root / video_table_name), mode="overwrite")
+        indexes_built["videos"] = _write_lance_table(
+            lance,
+            media_table,
+            table_root / video_table_name,
+            max_bytes_per_file=VIDEOS_MAX_BYTES_PER_FILE,
+            max_rows_per_file=VIDEOS_MAX_ROWS_PER_FILE,
+            scalar_indexes=SCALAR_INDEX_COLUMNS["videos"],
+        )
 
     target_meta = target / "meta"
     target_meta.mkdir(parents=True, exist_ok=True)
     (target_meta / "info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     _write_stats_json(target_meta, episode_rows)
     _write_tasks_json(target_meta, task_lookup, episode_rows)
+    _write_episodes_jsonl(target_meta, episode_rows, split_by_episode)
+    _write_splits_json(target_meta, episode_rows, split_by_episode)
     _write_manifest(
         target,
         source=source,
@@ -279,6 +340,7 @@ def convert_lerobot_to_lance(
         output_layout=output_layout,
         dataset_id=dataset_id,
         source_repo_id=source_repo_id,
+        indexes_built=indexes_built,
     )
     if output_layout == "hf":
         _write_hf_sessions_json(
@@ -316,6 +378,45 @@ def convert_lerobot_to_lance(
 
 
 # ---------------------------------------------------------------- file readers
+
+
+def _write_lance_table(
+    lance: Any,
+    table: Any,
+    path: Path,
+    *,
+    max_rows_per_file: int | None = None,
+    max_bytes_per_file: int | None = None,
+    scalar_indexes: list[str] | None = None,
+) -> list[str]:
+    """Write a Lance table with fragment caps and create scalar BTREE indexes.
+
+    Returns the list of columns that ended up indexed (best-effort: columns
+    missing from the table are skipped silently).
+    """
+    write_kwargs: dict[str, Any] = {"mode": "overwrite"}
+    if max_rows_per_file is not None:
+        write_kwargs["max_rows_per_file"] = int(max_rows_per_file)
+    if max_bytes_per_file is not None:
+        write_kwargs["max_bytes_per_file"] = int(max_bytes_per_file)
+    lance.write_dataset(table, str(path), **write_kwargs)
+
+    indexed: list[str] = []
+    if not scalar_indexes:
+        return indexed
+    available = set(table.schema.names)
+    dataset = lance.dataset(str(path))
+    for column in scalar_indexes:
+        if column not in available:
+            continue
+        try:
+            dataset.create_scalar_index(column, index_type="BTREE")
+        except Exception:
+            # Index creation failures should not abort the conversion; the
+            # data is still valid, indexes are an optimization.
+            continue
+        indexed.append(column)
+    return indexed
 
 
 def _load_info(source: Path) -> dict[str, Any]:
@@ -548,16 +649,25 @@ def _media_row(
     height, width = _video_shape(feature_info)
     rel = str(video_path.relative_to(source))
     source_uri = _source_media_uri(source_repo_id, rel, video_path)
+    media_id = _media_id(episode_index, camera_norm)
+    source_payload = {
+        "uri": source_uri,
+        "repo_id": source_repo_id,
+        "dataset_url": _hf_dataset_url(source_repo_id),
+        "media_id": media_id,
+        "relative_path": rel,
+    }
     return {
-        "media_id": f"episode_{episode_index:06d}_{camera_norm}",
+        "media_id": media_id,
         "episode_id": f"episode_{episode_index:06d}",
         "episode_index": episode_index,
         "camera_id": camera_norm,
         "camera_name": camera_key,
         "media_type": "video",
+        "source": source_payload,
         "source_uri": source_uri,
         "source_dataset_url": _hf_dataset_url(source_repo_id),
-        "source_media_id": f"episode_{episode_index:06d}_{camera_norm}",
+        "source_media_id": media_id,
         "source_relative_path": rel,
         "uri": rel,
         "relative_path": rel,
@@ -577,6 +687,29 @@ def _media_row(
     }
 
 
+def _media_id(episode_index: int, camera_norm: str) -> str:
+    return f"episode_{episode_index:06d}_{camera_norm}"
+
+
+def _camera_segment(
+    *,
+    camera_key: str,
+    camera_norm: str,
+    media_id: str,
+    num_frames: int,
+    fps: float,
+) -> dict[str, Any]:
+    return {
+        "camera_key": camera_key,
+        "camera_column": camera_norm,
+        "media_id": media_id,
+        "from_timestamp": 0.0,
+        "to_timestamp": (num_frames - 1) / fps if num_frames > 0 else None,
+        "frame_start": 0,
+        "frame_count": int(num_frames),
+    }
+
+
 def _source_media_uri(source_repo_id: str | None, rel: str, video_path: Path) -> str:
     if source_repo_id and "/" in source_repo_id:
         return f"hf://datasets/{source_repo_id}/{rel}"
@@ -589,6 +722,87 @@ def _hf_dataset_url(source_repo_id: str | None) -> str | None:
     return None
 
 
+def _task_segments_from_frames(
+    frames: list[dict[str, Any]],
+    *,
+    timestamps: list[float],
+    default_task_index: int,
+    default_language: str | None,
+    task_lookup: dict[int, str],
+) -> list[dict[str, Any]]:
+    if not frames:
+        return []
+    task_indices = [
+        int(frame.get("task_index"))
+        if frame.get("task_index") is not None
+        else int(default_task_index)
+        for frame in frames
+    ]
+    segments: list[dict[str, Any]] = []
+    start = 0
+    current = task_indices[0]
+    for index, task_index in enumerate(task_indices[1:], start=1):
+        if task_index == current:
+            continue
+        segments.append(
+            _task_segment(
+                current,
+                start,
+                index - 1,
+                timestamps,
+                task_lookup=task_lookup,
+                default_language=default_language,
+            )
+        )
+        start = index
+        current = task_index
+    segments.append(
+        _task_segment(
+            current,
+            start,
+            len(task_indices) - 1,
+            timestamps,
+            task_lookup=task_lookup,
+            default_language=default_language,
+        )
+    )
+    return segments
+
+
+def _task_segment(
+    task_index: int,
+    start_frame: int,
+    end_frame: int,
+    timestamps: list[float],
+    *,
+    task_lookup: dict[int, str],
+    default_language: str | None,
+) -> dict[str, Any]:
+    language = task_lookup.get(int(task_index)) or default_language
+    return {
+        "task_index": int(task_index),
+        "language_instruction": language,
+        "start_frame": int(start_frame),
+        "end_frame": int(end_frame),
+        "start_timestamp": float(timestamps[start_frame]) if timestamps else None,
+        "end_timestamp": float(timestamps[end_frame]) if timestamps else None,
+    }
+
+
+def _trajectory_sha256(
+    timestamps: list[float],
+    states: list[list[float]],
+    actions: list[list[float]],
+) -> str:
+    payload = {
+        "timestamps": timestamps,
+        "observation_state": states,
+        "actions": actions,
+    }
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _write_stats_json(meta_dir: Path, episode_rows: list[dict[str, Any]]) -> None:
     states: list[list[float]] = []
     actions: list[list[float]] = []
@@ -599,6 +813,36 @@ def _write_stats_json(meta_dir: Path, episode_rows: list[dict[str, Any]]) -> Non
         "observation.state": _vector_stats(states),
         "action": _vector_stats(actions),
     }
+    stats_dir = meta_dir / "stats"
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    (stats_dir / "state_body.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "modality": "state.body",
+                "feature": "observation.state",
+                **stats["observation.state"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (stats_dir / "action_body.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "action": "action.body",
+                "feature": "action",
+                **stats["action"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (meta_dir / "stats.json").write_text(
         json.dumps(stats, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -631,6 +875,67 @@ def _write_tasks_json(
         ],
     }
     (meta_dir / "tasks.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tasks_jsonl = "\n".join(
+        json.dumps(
+            {
+                "task_index": row["task_index"],
+                "task": row.get("language_instruction"),
+                "language_instruction": row.get("language_instruction"),
+                "episode_count": row.get("episode_count", 0),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for row in payload["tasks"]
+    )
+    (meta_dir / "tasks.jsonl").write_text(tasks_jsonl + ("\n" if tasks_jsonl else ""), encoding="utf-8")
+
+
+def _write_episodes_jsonl(
+    meta_dir: Path,
+    episode_rows: list[dict[str, Any]],
+    split_by_episode: dict[int, str],
+) -> None:
+    lines = []
+    for row in sorted(episode_rows, key=lambda item: int(item["episode_index"])):
+        episode_index = int(row["episode_index"])
+        lines.append(
+            json.dumps(
+                {
+                    "episode_index": episode_index,
+                    "task_index": int(row.get("task_index") or 0),
+                    "tasks": [row.get("language_instruction")]
+                    if row.get("language_instruction")
+                    else [],
+                    "length": int(row.get("length") or 0),
+                    "split": split_by_episode.get(episode_index, "train"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    (meta_dir / "episodes.jsonl").write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _write_splits_json(
+    meta_dir: Path,
+    episode_rows: list[dict[str, Any]],
+    split_by_episode: dict[int, str],
+) -> None:
+    splits: dict[str, list[int]] = {}
+    for row in episode_rows:
+        episode_index = int(row["episode_index"])
+        split = split_by_episode.get(episode_index, "train")
+        splits.setdefault(split, []).append(episode_index)
+    payload = {
+        "schema_version": "1.0",
+        "strategy": "source_split_or_all_train",
+        "splits": {key: sorted(value) for key, value in sorted(splits.items())},
+    }
+    (meta_dir / "splits.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
@@ -677,6 +982,93 @@ def _std(values: list[float], mean: float) -> float:
     return math.sqrt(variance)
 
 
+def _video_modality_key(camera_key: str) -> str:
+    if camera_key.startswith("observation.images."):
+        return f"video.{camera_key.removeprefix('observation.images.')}"
+    return f"video.{_normalize_camera_key(camera_key)}"
+
+
+def _build_modalities(
+    *,
+    camera_keys: list[str],
+    cameras_norm: list[str],
+    state_dim: int,
+    fps: float,
+    episodes_path: str,
+    frames_path: str,
+    media_path: str,
+) -> dict[str, Any]:
+    modalities: dict[str, Any] = {
+        "state.body": {
+            "kind": "state",
+            "source_key": "observation.state",
+            "table": "episodes",
+            "path": episodes_path,
+            "column": "observation_state",
+            "frame_table": "frames",
+            "frame_path": frames_path,
+            "frame_column": "observation_state",
+            "names_ref": "meta/info.json#/features/observation.state/names",
+            "shape": [int(state_dim)],
+            "rate_hz": float(fps),
+            "stats": "meta/stats/state_body.json",
+        }
+    }
+    for camera_key, camera_norm in zip(camera_keys, cameras_norm):
+        modalities[_video_modality_key(camera_key)] = {
+            "kind": "video",
+            "source_key": camera_key,
+            "camera_key": camera_key,
+            "camera_column": camera_norm,
+            "table": "videos",
+            "path": media_path,
+            "media_id_column": "media_id",
+            "blob_column": "video_blob",
+            "segment_column": "camera_segments",
+            "names_ref": f"meta/info.json#/features/{camera_key}/names",
+            "shape_ref": f"meta/info.json#/features/{camera_key}/shape",
+            "rate_hz": float(fps),
+        }
+    return modalities
+
+
+def _build_actions(*, action_dim: int, fps: float, episodes_path: str, frames_path: str) -> dict[str, Any]:
+    return {
+        "action.body": {
+            "kind": "action",
+            "source_key": "action",
+            "table": "episodes",
+            "path": episodes_path,
+            "column": "actions",
+            "frame_table": "frames",
+            "frame_path": frames_path,
+            "frame_column": "action",
+            "names_ref": "meta/info.json#/features/action/names",
+            "shape": [int(action_dim)],
+            "rate_hz": float(fps),
+            "stats": "meta/stats/action_body.json",
+            "alignment": "same_frame_timestamp",
+        }
+    }
+
+
+def _format_created_indexes(
+    indexes_built: dict[str, list[str]],
+    *,
+    episodes_path: str,
+    frames_path: str | None,
+    media_path: str | None,
+) -> list[dict[str, Any]]:
+    table_paths = {"episodes": episodes_path, "frames": frames_path, "videos": media_path}
+    out: list[dict[str, Any]] = []
+    for kind, columns in indexes_built.items():
+        path = table_paths.get(kind)
+        if not path or not columns:
+            continue
+        out.append({"table": path, "index_type": "BTREE", "columns": list(columns)})
+    return out
+
+
 def _write_manifest(
     target: Path,
     *,
@@ -695,6 +1087,7 @@ def _write_manifest(
     output_layout: str,
     dataset_id: str | None,
     source_repo_id: str | None,
+    indexes_built: dict[str, list[str]] | None = None,
 ) -> None:
     is_hf = output_layout == "hf"
     episodes_path = "data/episodes.lance" if is_hf else "episodes.lance"
@@ -751,9 +1144,84 @@ def _write_manifest(
         "camera_keys": camera_keys,
         "camera_columns": cameras_norm,
         "camera_key_to_column": dict(zip(camera_keys, cameras_norm)),
+        "modalities": _build_modalities(
+            camera_keys=camera_keys,
+            cameras_norm=cameras_norm,
+            state_dim=state_dim,
+            fps=fps,
+            episodes_path=episodes_path,
+            frames_path=frames_path,
+            media_path=media_path,
+        ),
+        "actions": _build_actions(
+            action_dim=action_dim,
+            fps=fps,
+            episodes_path=episodes_path,
+            frames_path=frames_path,
+        ),
         "fps": float(fps),
         "state_dim": int(state_dim),
         "action_dim": int(action_dim),
+        "rates": {
+            "fps": float(fps),
+            "modalities": {
+                "state.body": float(fps),
+                **{_video_modality_key(key): float(fps) for key in camera_keys},
+            },
+            "actions": {"action.body": float(fps)},
+        },
+        "capabilities": {
+            "inline_video_blobs": bool(has_media),
+            "videos_table": bool(has_media),
+            "frames_table": bool(include_frames),
+            "camera_segments": True,
+            "task_segments": True,
+            "trajectory_sha256": True,
+            "per_modality_stats": True,
+        },
+        "reader_hints": {
+            "prefer_registry": True,
+            "video_lookup": "videos.media_id",
+            "normalization": "meta/stats.json",
+            "per_modality_stats_dir": "meta/stats",
+            "legacy_aliases_available": True,
+            "lazy_blob_columns": {media_path: ["video_blob"]} if has_media else {},
+            "fragment_strategy": {
+                **({episodes_path: {"max_rows_per_file": TRAJ_MAX_ROWS_PER_FILE}}),
+                **({frames_path: {"max_rows_per_file": TRAJ_MAX_ROWS_PER_FILE}} if include_frames else {}),
+                **(
+                    {
+                        media_path: {
+                            "max_bytes_per_file": VIDEOS_MAX_BYTES_PER_FILE,
+                            "max_rows_per_file": VIDEOS_MAX_ROWS_PER_FILE,
+                        }
+                    }
+                    if has_media
+                    else {}
+                ),
+            },
+        },
+        "indexes": {
+            "created": _format_created_indexes(
+                indexes_built or {},
+                episodes_path=episodes_path,
+                frames_path=frames_path if include_frames else None,
+                media_path=media_path if has_media else None,
+            ),
+            "recommended": [
+                {"table": episodes_path, "columns": ["episode_index"]},
+                *(
+                    [{"table": frames_path, "columns": ["episode_index", "frame_index"]}]
+                    if include_frames
+                    else []
+                ),
+                *(
+                    [{"table": media_path, "columns": ["media_id", "episode_index", "camera_id"]}]
+                    if has_media
+                    else []
+                ),
+            ],
+        },
         "media_mode": "videos_table",
         "camera_storage": "videos_table",
         "blob_storage": {
@@ -764,7 +1232,13 @@ def _write_manifest(
         "meta": {
             "info": "meta/info.json",
             "stats": "meta/stats.json",
+            "stats_dir": "meta/stats",
+            "state_body_stats": "meta/stats/state_body.json",
+            "action_body_stats": "meta/stats/action_body.json",
             "tasks": "meta/tasks.json",
+            "tasks_jsonl": "meta/tasks.jsonl",
+            "episodes_jsonl": "meta/episodes.jsonl",
+            "splits": "meta/splits.json",
         },
         "stats": {
             "format": "lerobot_style_state_action_v1",
@@ -918,6 +1392,38 @@ def _build_episodes_schema(pa: Any, cameras_norm: list[str]) -> Any:
         pa.field("observation_state", pa.list_(pa.list_(pa.float32()))),
         pa.field("actions", pa.list_(pa.list_(pa.float32()))),
         pa.field("language_instruction", pa.string()),
+        pa.field(
+            "camera_segments",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("camera_key", pa.string()),
+                        pa.field("camera_column", pa.string()),
+                        pa.field("media_id", pa.string()),
+                        pa.field("from_timestamp", pa.float64()),
+                        pa.field("to_timestamp", pa.float64()),
+                        pa.field("frame_start", pa.int64()),
+                        pa.field("frame_count", pa.int64()),
+                    ]
+                )
+            ),
+        ),
+        pa.field(
+            "task_segments",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("task_index", pa.int64()),
+                        pa.field("language_instruction", pa.string()),
+                        pa.field("start_frame", pa.int64()),
+                        pa.field("end_frame", pa.int64()),
+                        pa.field("start_timestamp", pa.float64()),
+                        pa.field("end_timestamp", pa.float64()),
+                    ]
+                )
+            ),
+        ),
+        pa.field("trajectory_sha256", pa.string()),
     ]
     for camera_norm in cameras_norm:
         fields.append(pa.field(f"{camera_norm}_from_timestamp", pa.float64()))
@@ -951,6 +1457,18 @@ def _build_media_schema(pa: Any) -> Any:
             pa.field("camera_id", pa.string()),
             pa.field("camera_name", pa.string(), nullable=False),
             pa.field("media_type", pa.string()),
+            pa.field(
+                "source",
+                pa.struct(
+                    [
+                        pa.field("uri", pa.string()),
+                        pa.field("repo_id", pa.string()),
+                        pa.field("dataset_url", pa.string()),
+                        pa.field("media_id", pa.string()),
+                        pa.field("relative_path", pa.string()),
+                    ]
+                ),
+            ),
             pa.field("source_uri", pa.string()),
             pa.field("source_dataset_url", pa.string()),
             pa.field("source_media_id", pa.string()),

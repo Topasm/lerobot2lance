@@ -147,18 +147,35 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             # Source info.json copied — downstream camera_info discovery relies on this.
             self.assertTrue((target / "meta" / "info.json").exists())
             self.assertTrue((target / "meta" / "stats.json").exists())
+            self.assertTrue((target / "meta" / "stats" / "state_body.json").exists())
+            self.assertTrue((target / "meta" / "stats" / "action_body.json").exists())
             self.assertTrue((target / "meta" / "tasks.json").exists())
+            self.assertTrue((target / "meta" / "tasks.jsonl").exists())
+            self.assertTrue((target / "meta" / "episodes.jsonl").exists())
+            self.assertTrue((target / "meta" / "splits.json").exists())
 
             # Episode rows include the language/task caption from tasks.jsonl
             import lance
 
             ds = lance.dataset(str(target / "episodes.lance"))
             row = ds.scanner(
-                columns=["episode_index", "language_instruction", "fps", "length"], limit=2
+                columns=[
+                    "episode_index",
+                    "language_instruction",
+                    "fps",
+                    "length",
+                    "camera_segments",
+                    "task_segments",
+                    "trajectory_sha256",
+                ],
+                limit=2,
             ).to_table().to_pylist()
             self.assertEqual(row[0]["language_instruction"], "pick-and-place")
             self.assertEqual(row[0]["fps"], 30.0)
             self.assertEqual(row[0]["length"], 4)
+            self.assertEqual(row[0]["camera_segments"][0]["media_id"], "episode_000000_observation_images_cam_head")
+            self.assertEqual(row[0]["task_segments"][0]["task_index"], 0)
+            self.assertEqual(len(row[0]["trajectory_sha256"]), 64)
 
             manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["format"], "rllab_lance_session_v1")
@@ -181,6 +198,12 @@ class LerobotToLanceConversionTest(unittest.TestCase):
                 manifest["camera_key_to_column"],
                 {"observation.images.cam_head": "observation_images_cam_head"},
             )
+            self.assertIn("state.body", manifest["modalities"])
+            self.assertIn("video.cam_head", manifest["modalities"])
+            self.assertIn("action.body", manifest["actions"])
+            self.assertTrue(manifest["capabilities"]["camera_segments"])
+            self.assertEqual(manifest["meta"]["tasks_jsonl"], "meta/tasks.jsonl")
+            self.assertEqual(manifest["meta"]["state_body_stats"], "meta/stats/state_body.json")
             self.assertEqual(manifest["counts"]["episodes"], 2)
             self.assertEqual(manifest["counts"]["frames"], 8)
             self.assertEqual(manifest["counts"]["videos"], 2)
@@ -210,6 +233,7 @@ class LerobotToLanceConversionTest(unittest.TestCase):
                 columns=[
                     "camera_name",
                     "media_type",
+                    "source",
                     "source_uri",
                     "source_relative_path",
                     "relative_path",
@@ -224,6 +248,7 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             ).to_table().to_pylist()[0]
             self.assertEqual(media_row["camera_name"], "observation.images.cam_head")
             self.assertEqual(media_row["media_type"], "video")
+            self.assertTrue(media_row["source"]["uri"].endswith("episode_000000.mp4"))
             self.assertTrue(media_row["source_uri"].endswith("episode_000000.mp4"))
             self.assertEqual(
                 media_row["source_relative_path"],
@@ -241,6 +266,8 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(stats["action"]["count"], [8, 8, 8])
             tasks = json.loads((target / "meta" / "tasks.json").read_text())
             self.assertEqual(tasks["tasks"][0]["language_instruction"], "pick-and-place")
+            splits = json.loads((target / "meta" / "splits.json").read_text())
+            self.assertEqual(splits["splits"]["train"], [0, 1])
 
     def test_refuses_existing_target_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -307,7 +334,11 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertTrue((target / "meta" / "info.json").exists())
             self.assertTrue((target / "meta" / "sessions.json").exists())
             self.assertTrue((target / "meta" / "stats.json").exists())
+            self.assertTrue((target / "meta" / "stats" / "state_body.json").exists())
             self.assertTrue((target / "meta" / "tasks.json").exists())
+            self.assertTrue((target / "meta" / "tasks.jsonl").exists())
+            self.assertTrue((target / "meta" / "episodes.jsonl").exists())
+            self.assertTrue((target / "meta" / "splits.json").exists())
             for name in ("episodes.lance", "frames.lance", "videos.lance"):
                 self.assertTrue((target / "data" / name).exists(), f"{name} missing")
             self.assertFalse((target / "media.lance").exists())
@@ -329,6 +360,9 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(manifest["counts"]["frames"], 6)
             self.assertEqual(manifest["counts"]["videos"], 2)
             self.assertEqual(manifest["meta"]["stats"], "meta/stats.json")
+            self.assertEqual(manifest["meta"]["splits"], "meta/splits.json")
+            self.assertEqual(manifest["modalities"]["state.body"]["column"], "observation_state")
+            self.assertEqual(manifest["actions"]["action.body"]["column"], "actions")
             self.assertEqual(manifest["stats"]["source_table"], "data/episodes.lance")
             self.assertEqual(manifest["tasks"]["path"], "meta/tasks.json")
             self.assertEqual(manifest["total_episodes"], 2)
@@ -348,6 +382,32 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(videos.count_rows(), 2)
             sessions = json.loads((target / "meta" / "sessions.json").read_text())
             self.assertEqual(sessions[0]["episodes"], 2)
+
+            blob_field = videos.schema.field("video_blob")
+            self.assertEqual(
+                blob_field.metadata.get(b"lance-encoding:blob"), b"true"
+            )
+
+            video_indices = {idx["name"] for idx in videos.list_indices()}
+            self.assertIn("episode_index_idx", video_indices)
+            self.assertIn("camera_id_idx", video_indices)
+            self.assertIn("media_id_idx", video_indices)
+            episode_indices = {idx["name"] for idx in episodes.list_indices()}
+            self.assertIn("episode_index_idx", episode_indices)
+
+            created = manifest["indexes"]["created"]
+            tables_indexed = {entry["table"] for entry in created}
+            self.assertIn("data/videos.lance", tables_indexed)
+            self.assertIn("data/episodes.lance", tables_indexed)
+            self.assertEqual(
+                manifest["reader_hints"]["lazy_blob_columns"],
+                {"data/videos.lance": ["video_blob"]},
+            )
+            frag_strategy = manifest["reader_hints"]["fragment_strategy"]
+            self.assertEqual(
+                frag_strategy["data/videos.lance"]["max_bytes_per_file"],
+                2 * 1024 * 1024 * 1024,
+            )
 
 
 class ErrorPathTest(unittest.TestCase):
