@@ -60,7 +60,6 @@ dataset_root/
     stats/
       state_body.json          # canonical state.body normalization stats
       action_body.json         # canonical action.body normalization stats
-    compat/                    # OPTIONAL non-contract exports; never canonical
   data/
     episodes.lance             # episode trajectory table
     frames.lance               # per-frame index/QA table
@@ -68,10 +67,9 @@ dataset_root/
 ```
 
 Canonical producers MUST emit only the canonical files listed above. v2.0
-removes the root-level `meta/tasks.json` and `meta/stats.json` compatibility
-sidecars. If a producer chooses to emit compatibility exports for legacy
-ecosystem tools, those files MUST live under `meta/compat/` and validators
-MUST NOT treat them as canonical.
+does not define compatibility sidecars. Root-level `meta/tasks.json` and
+`meta/stats.json` are forbidden, and there is no `meta/compat/` escape hatch
+in the canonical published layout.
 
 `meta/robot.json` is not part of the LeRobot-source standard. It is reserved
 for non-LeRobot sources that cannot provide `meta/info.json.features.*.names`.
@@ -155,7 +153,7 @@ explicitly configured to require that capability.
 
 ### 3.4 Lance storage contract
 
-Published v1.0 bundles use Lance Blob v2, not the legacy
+Published v2.0 bundles use Lance Blob v2, not the legacy
 `large_binary + lance-encoding:blob=true` metadata path.
 
 ```json
@@ -175,13 +173,13 @@ Writer requirements:
 - `video_blob` MUST be declared with `lance.blob_field("video_blob")`.
 - `video_blob` values MUST be created with `lance.blob_array(...)`.
 - Published bundles MUST use inline byte blobs only. External URI blob values
-  and external URI slices are forbidden in published v1.0 bundles.
+  and external URI slices are forbidden in published v2.0 bundles.
 - Legacy `large_binary + lance-encoding:blob=true` blob columns are forbidden
-  in v1.0 stable bundles.
+  in v2.0 stable bundles.
 
 ## 4. Lance tables
 
-Each table schema below is split into four classes. Producers must satisfy the
+Each table schema below is split into three classes. Producers must satisfy the
 required classes; readers must tolerate optionals being absent.
 
 | class | meaning |
@@ -189,7 +187,6 @@ required classes; readers must tolerate optionals being absent.
 | **Required non-null** | Producer MUST emit the column and value MUST NOT be null. Readers may assume presence and non-null. |
 | **Required nullable** | Producer MUST emit the column. Value MAY be null when the source is missing the data. |
 | **Optional** | Producer MAY emit. Reader MUST tolerate absence and treat null/missing identically. |
-| **Deprecated alias** | Producer MAY emit for back-compat; new readers SHOULD prefer the canonical column instead. |
 
 Within each table the column tables below mark this class in the "notes"
 column when it is not obvious from context. Columns without a class marker
@@ -269,7 +266,7 @@ actions              : float32 little-endian × length × action_dim  (row-major
 ```
 
 `NaN` and `±Inf` are forbidden in the canonical trajectory arrays. JSON-based
-hashing is **not** valid for v1.0; binary encoding is the only conformant form.
+hashing is **not** valid for v2.0; binary encoding is the only conformant form.
 
 **Forbidden:** `*_video_blob` columns. Episodes never carry inline MP4 bytes.
 
@@ -390,9 +387,8 @@ Merged/pretrain bundles may include `data/train_episodes.lance` and point
 | `sessions.json` | provenance per source dataset/session | yes | RLLAB-specific |
 
 Root-level `meta/tasks.json` and `meta/stats.json` are removed in v2.0 and
-are not part of the canonical sidecar set. If compatibility exports are
-emitted, they MUST live under `meta/compat/` and validators MUST NOT treat
-them as canonical.
+are not part of the canonical sidecar set. Canonical producers MUST NOT emit
+compatibility copies elsewhere in the published bundle.
 
 `tasks.jsonl` and `episodes.jsonl` are the canonical task/episode metadata.
 Do not introduce a second disk source of truth for the same task data. If a
@@ -618,7 +614,7 @@ Reader requirements:
 | **Episodes carry no `*_video_blob` columns** | Video bytes live in exactly one canonical table, keeping size predictable as cameras grow. |
 | **Three-table layout** | `episodes` for trajectories, `frames` for QA/random-frame access, `videos` for media. |
 | **State/action duplicated in `frames.lance`** | Avoids joins for random-frame loaders and viewers. |
-| **`camera_segments` in episodes** | Canonical media references survive camera/media schema growth; per-camera timestamp columns are aliases. |
+| **`camera_segments` in episodes** | Canonical media references survive camera/media schema growth; per-camera timestamp alias columns are removed in v2.0. |
 | **`task_segments` in episodes** | Preserves LeRobot v3-style intra-episode task transitions; `task_index` remains a representative alias. |
 | **`trajectory_sha256` in episodes** | Cheap trajectory integrity check across converter/merge/publish stages. |
 | **Per-modality stats** | Lets training load only the stats it needs and avoids startup scans. |
@@ -654,10 +650,10 @@ Migration policy:
 
 ## 11. Conformance checklist
 
-A bundle can be treated as v1.0 stable only if these checks pass:
+A bundle can be treated as v2.0 stable only if these checks pass:
 
 1. `manifest.json` includes every §3.1 canonical key.
-2. `manifest.capabilities` uses only documented v1.0 flags or clearly ignored
+2. `manifest.capabilities` uses only documented v2.0 flags or clearly ignored
    extension flags.
 3. `manifest.lance.data_storage_version >= "2.2"`,
    `manifest.lance.blob_encoding == "lance.blob.v2"`, and

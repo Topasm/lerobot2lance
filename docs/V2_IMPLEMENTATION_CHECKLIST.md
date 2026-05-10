@@ -12,6 +12,25 @@ This checklist is the working tracker for promoting the v2 contract to stable.
 The full design rationale lives in [`STANDARD.md`](STANDARD.md) and the
 deeper plan in [`checklist.md`](checklist.md).
 
+## Status (in-repo)
+
+**`lerobot2lance` converter + validator: complete for new-data creation.**
+A fresh LeRobot dataset can be converted with
+`lerobot2lance --layout hf --target <out>` and verified with
+`scripts/validate_bundle.py <out>`; both produce a v2-clean bundle that
+passes every conformance test in this repo (19 / 19, last run on 2026-05-11).
+
+Legacy-bundle migration and the pretrain merge re-run that depended on it
+are out of scope — the lab is creating fresh v2 bundles from current
+source LeRobot data, not migrating old `data/converted_19d/*` artifacts.
+
+Cross-repo status: `rllab-training` now reads v2 bundles without v1 aliases,
+and the `robo_dataview` backend can open the ubless v2 probe bundle, list
+episodes, read state/action timeseries, and fetch videos by
+`camera_segments[*].media_id -> videos.media_id -> take_blobs`. Remaining
+cross-repo work is action-semantics enforcement, task-segment UI display,
+publisher adoption, and publish/remote smoke tasks.
+
 Legend:
 
 ```text
@@ -28,9 +47,9 @@ Legend:
 | Section | Scope | Done | Partial | Open | Deferred |
 | --- | --- | --- | --- | --- | --- |
 | A | `lerobot2lance` v2 contract | 11 | 0 | 1 | 0 |
-| B | Cross-repo consumers (`rllab-training`, `robo_dataview`, `rllab-data-collection`) | 0 | 0 | 30 | 0 |
+| B | Cross-repo consumers (`rllab-training`, `robo_dataview`, `rllab-data-collection`) | 8 | 1 | 12 | 0 |
 | C | Conformance / validator suite | 7 | 0 | 0 | 0 |
-| D | Operational data tasks (re-conversion, smoke tests, publish) | 0 | 0 | 12 | 0 |
+| D | Operational data tasks (smoke tests, publish) | 1 | 1 | 6 | 0 |
 | E | Open questions | 0 | 0 | 1 | 0 |
 
 ---
@@ -106,16 +125,16 @@ back to v1 aliases.
 
 ### B1. `rllab-training`
 
-* [ ] **B1.1.** Recognize `format == "rllab_published_lance_dataset_v2"` as the
+* [x] **B1.1.** Recognize `format == "rllab_published_lance_dataset_v2"` as the
   primary discriminator and refuse v1 bundles with a clear error.
-* [ ] **B1.2.** Resolve state / action / video columns via
+* [x] **B1.2.** Resolve state / action / video columns via
   `manifest.modalities` and `manifest.actions` only. No flat-alias fallback.
-* [ ] **B1.3.** Read normalization stats only from `meta/stats/*.json`; remove
+* [x] **B1.3.** Read normalization stats only from `meta/stats/*.json`; remove
   any `meta/stats.json` aggregate fallback.
 * [ ] **B1.4.** Honor `task_segments.end_frame_exclusive` everywhere range math
   is performed.
 * [ ] **B1.5.** Tolerate / verify the binary `trajectory_sha256` shape.
-* [ ] **B1.6.** Fetch video bytes via `videos.media_id` + Lance Blob v2
+* [x] **B1.6.** Fetch video bytes via `videos.media_id` + Lance Blob v2
   `take_blobs`; never project `video_blob` in metadata scans.
 * [ ] **B1.7.** Use `manifest.actions.action.body.semantics` to configure the
   action head, and refuse to silently train when `command_type == "unknown"`.
@@ -125,13 +144,16 @@ back to v1 aliases.
 (Deprioritized for ship-blocking, but tracked here so v2.0 promotion does not
 silently break the viewer.)
 
-* [ ] **B2.1.** Recognize the v2 format identifier.
-* [ ] **B2.2.** Discover cameras from `manifest.modalities.video.*`; stop
+* [x] **B2.1.** Recognize the v2 format identifier.
+* [x] **B2.2.** Discover cameras from `manifest.modalities.video.*`; stop
   reading the `camera_keys` / `camera_columns` flat aliases.
-* [ ] **B2.3.** Resolve `camera_segments[*].media_id` against `videos.media_id`
+* [x] **B2.3.** Resolve `camera_segments[*].media_id` against `videos.media_id`
   for video lookup.
-* [ ] **B2.4.** Use `media_id + sha256` as the decoder cache key.
-* [ ] **B2.5.** Fetch video bytes via Blob v2 `take_blobs`; do not reach for
+* [~] **B2.4.** Use `media_id + sha256` as the decoder cache key. Backend
+  lookup now uses stable `media_id`; no persistent viewer decoder cache is
+  currently maintained in `lance_store.py`, so `sha256` cache-key integration
+  remains for the frontend / Rerun cache path if a decoder cache is added.
+* [x] **B2.5.** Fetch video bytes via Blob v2 `take_blobs`; do not reach for
   the removed `uri` / `video_path` columns.
 * [ ] **B2.6.** Render `task_segments` as half-open ranges in the UI.
 * [ ] **B2.7.** Surface action semantics (joint vs. EE pose, delta vs.
@@ -201,29 +223,27 @@ silently break the viewer.)
 
 ## D. Operational data tasks
 
-These run against real datasets; none of them gate code review but all of
-them gate v2.0 stable promotion.
+Forward-looking smoke / publish tasks for fresh v2 bundles. Legacy-bundle
+re-conversion and the pretrain merge re-run that depended on it are out
+of scope — the lab starts from current source data.
 
-* [ ] **D1.** Archive (or delete) every legacy `data/converted_19d/*` bundle.
-* [ ] **D2.** Re-convert every source LeRobot dataset to v2 with the current
-  `lerobot2lance` converter.
-* [ ] **D3.** Run `scripts/validate_bundle.py` on each freshly converted
-  bundle and require zero errors.
-* [ ] **D4.** Run `scripts/validate_converted_root.py` over the converted
+* [ ] **D1.** Run `scripts/validate_bundle.py` on each freshly converted
+  v2 bundle and require zero errors.
+* [ ] **D2.** Run `scripts/validate_converted_root.py` over the converted
   root and require zero errors per bundle.
-* [ ] **D5.** Re-run the pretrain merge via
-  `scripts/build_pretrain_19d_lance.py` against the v2-only inputs.
-* [ ] **D6.** Validate the merged pretrain bundle with the same v2 strict
-  validator pipeline.
-* [ ] **D7.** Sample `rllab-training` smoke run on the merged bundle.
-* [ ] **D8.** Sample `robo_dataview` smoke run on a converted bundle (when
-  B2 lands).
-* [ ] **D9.** HF publish dry-run for one converted bundle.
-* [ ] **D10.** HF published-bundle remote read test (manifest + sidecars +
+* [~] **D3.** Sample `rllab-training` smoke run on a fresh v2 bundle.
+  Loader/normalizer/inspect smoke passed on the ubless v2 probe bundle; a
+  short optimizer training step remains if needed.
+* [x] **D4.** Sample `robo_dataview` backend smoke run on a converted bundle:
+  ubless v2 probe opens, summarizes 10 episodes / 3150 frames, lists 3 cameras,
+  returns 322-frame state/action timeseries for episode 0, and fetches the
+  `cam_head` MP4 blob via Blob v2.
+* [ ] **D5.** HF publish dry-run for one converted bundle.
+* [ ] **D6.** HF published-bundle remote read test (manifest + sidecars +
   schema).
-* [ ] **D11.** Remote video blob `take_blobs` round-trip from the published
+* [ ] **D7.** Remote video blob `take_blobs` round-trip from the published
   bundle.
-* [ ] **D12.** Confirm that remote metadata scans never project `video_blob`
+* [ ] **D8.** Confirm that remote metadata scans never project `video_blob`
   (network-traffic check).
 
 ---
