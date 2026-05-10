@@ -96,6 +96,7 @@ def load_converted_manifests(
         media = (
             manifest.get("total_video_segments")
             or manifest.get("total_videos")
+            or counts.get("videos")
             or counts.get("media")
             or report.get("media_written")
         )

@@ -26,6 +26,7 @@ import argparse
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 import json
+import math
 import shutil
 from pathlib import Path
 from typing import Any
@@ -218,6 +219,11 @@ def main() -> int:
     write_json(output / "meta" / "sessions.json", sessions)
     write_json(output / "meta" / "sources.json", source_rows)
     write_json(output / "meta" / "info.json", build_info(args.dataset_id, manifest, source_rows))
+    write_json(output / "meta" / "tasks.json", build_tasks(output / "data" / "episodes.lance"))
+    write_json(
+        output / "meta" / "stats.json",
+        compute_lerobot_stats(output / "data" / "train_episodes.lance"),
+    )
     (output / "README.md").write_text(render_readme(args.dataset_id, manifest, sessions), encoding="utf-8")
 
     print(f"wrote {output}", flush=True)
@@ -282,6 +288,7 @@ def discover_sources(
                 "videos": int(
                     manifest.get("total_video_segments")
                     or manifest.get("total_videos")
+                    or manifest.get("counts", {}).get("videos")
                     or manifest.get("counts", {}).get("media")
                     or 0
                 ),
@@ -306,6 +313,49 @@ def union_cameras(sources: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     columns_sorted = sorted(by_column)
     keys_sorted = [by_column[column] for column in columns_sorted]
     return keys_sorted, columns_sorted
+
+
+def build_tasks(episodes_path: Path) -> dict[str, Any]:
+    import lance
+
+    ds = lance.dataset(str(episodes_path))
+    tasks: dict[int, dict[str, Any]] = {}
+    for row in scan_rows(
+        ds,
+        columns=["episode_index", "task_index", "language_instruction"],
+    ):
+        task_index = as_int(row.get("task_index")) or 0
+        task = tasks.setdefault(
+            task_index,
+            {
+                "task_index": task_index,
+                "language_instruction": None,
+                "episode_count": 0,
+            },
+        )
+        task["episode_count"] += 1
+        language = row.get("language_instruction")
+        if isinstance(language, str) and language and not task["language_instruction"]:
+            task["language_instruction"] = language
+    return {
+        "schema_version": "1.0",
+        "tasks": [tasks[index] for index in sorted(tasks)],
+    }
+
+
+def compute_lerobot_stats(table_path: Path) -> dict[str, Any]:
+    import lance
+
+    states: list[list[float]] = []
+    actions: list[list[float]] = []
+    ds = lance.dataset(str(table_path))
+    for row in scan_rows(ds, columns=["observation_state", "actions"]):
+        states.extend(vector_rows(row.get("observation_state")))
+        actions.extend(vector_rows(row.get("actions")))
+    return {
+        "observation.state": vector_stats(states),
+        "action": vector_stats(actions),
+    }
 
 
 def build_episode_map(episodes_path: Path, episode_offset: int) -> dict[int, int]:
@@ -516,6 +566,7 @@ def transform_video(
         "camera_id": camera_id,
         "camera_name": row.get("camera_name"),
         "media_type": row.get("media_type"),
+        "source_uri": row.get("source_uri") or row.get("uri"),
         "uri": row.get("uri"),
         "relative_path": row.get("relative_path"),
         "video_blob": row.get("video_blob"),
@@ -617,6 +668,7 @@ def build_videos_schema(pa: Any) -> Any:
             pa.field("camera_id", pa.string()),
             pa.field("camera_name", pa.string()),
             pa.field("media_type", pa.string()),
+            pa.field("source_uri", pa.string()),
             pa.field("uri", pa.string()),
             pa.field("relative_path", pa.string()),
             video_blob_field,
@@ -710,8 +762,26 @@ def build_manifest(
             "state": "observation_state",
             "action": "actions",
         },
+        "frame_columns": {
+            "state": "observation_state",
+            "action": "action",
+        },
+        "state_action_alignment": {
+            "type": "same_frame_timestamp",
+            "episode_timestamp_column": "timestamps",
+            "frame_timestamp_column": "timestamp",
+            "state_episode_column": "observation_state",
+            "action_episode_column": "actions",
+            "state_frame_column": "observation_state",
+            "action_frame_column": "action",
+            "index_rule": (
+                "observation_state[i] and actions[i] are aligned to timestamps[i]; "
+                "the builder preserves source timing and does not shift actions."
+            ),
+        },
         "camera_keys": camera_keys,
         "camera_columns": camera_columns,
+        "camera_key_to_column": dict(zip(camera_keys, camera_columns)),
         "fps": primary_fps,
         "fps_values": fps_values,
         "fps_mode": "single" if len(fps_values) <= 1 else "mixed",
@@ -735,10 +805,37 @@ def build_manifest(
             "frames": {"path": "data/frames.lance", "exists": bool(frames)},
             "videos": {"path": "data/videos.lance", "exists": bool(videos)},
         },
+        "meta": {
+            "info": "meta/info.json",
+            "stats": "meta/stats.json",
+            "tasks": "meta/tasks.json",
+            "sessions": "meta/sessions.json",
+            "sources": "meta/sources.json",
+        },
+        "stats": {
+            "format": "lerobot_style_state_action_v1",
+            "path": "meta/stats.json",
+            "source_table": "data/train_episodes.lance",
+            "source_columns": {
+                "observation.state": "observation_state",
+                "action": "actions",
+            },
+            "features": ["observation.state", "action"],
+        },
+        "tasks": {
+            "path": "meta/tasks.json",
+            "task_index_column": "task_index",
+            "text_column": "language_instruction",
+        },
+        "media_path_columns": {
+            "relative_path": "relative_path",
+            "source_uri": "source_uri",
+            "deprecated_aliases": ["uri", "video_path"],
+        },
         "counts": {
             "episodes": episodes,
             "frames": frames,
-            "media": videos,
+            "videos": videos,
         },
         "total_episodes": episodes,
         "total_frames": frames,
@@ -914,6 +1011,47 @@ def as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def vector_rows(value: Any) -> list[list[float]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[list[float]] = []
+    for item in value:
+        if isinstance(item, list):
+            rows.append([float(v) for v in item])
+    return rows
+
+
+def vector_stats(vectors: list[list[float]]) -> dict[str, list[float]]:
+    if not vectors:
+        return {"mean": [], "std": [], "min": [], "max": [], "count": []}
+    dim = max(len(vector) for vector in vectors)
+    columns = [
+        [float(vector[index]) for vector in vectors if index < len(vector) and math.isfinite(float(vector[index]))]
+        for index in range(dim)
+    ]
+    means = [mean(column) for column in columns]
+    return {
+        "mean": means,
+        "std": [std(column, value) for column, value in zip(columns, means)],
+        "min": [min(column) if column else 0.0 for column in columns],
+        "max": [max(column) if column else 0.0 for column in columns],
+        "count": [len(column) for column in columns],
+    }
+
+
+def mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def std(values: list[float], value: float) -> float:
+    if len(values) <= 1:
+        return 0.0
+    variance = sum((item - value) ** 2 for item in values) / len(values)
+    return math.sqrt(variance)
 
 
 if __name__ == "__main__":

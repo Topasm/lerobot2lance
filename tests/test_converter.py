@@ -146,6 +146,8 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertTrue((target / "manifest.json").exists())
             # Source info.json copied — downstream camera_info discovery relies on this.
             self.assertTrue((target / "meta" / "info.json").exists())
+            self.assertTrue((target / "meta" / "stats.json").exists())
+            self.assertTrue((target / "meta" / "tasks.json").exists())
 
             # Episode rows include the language/task caption from tasks.jsonl
             import lance
@@ -170,8 +172,19 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertIsNone(manifest["video_frame_offset_column"])
             self.assertEqual(manifest["training_columns"]["state"], "observation_state")
             self.assertEqual(manifest["training_columns"]["action"], "actions")
+            self.assertEqual(manifest["frame_columns"]["state"], "observation_state")
+            self.assertEqual(manifest["frame_columns"]["action"], "action")
+            self.assertEqual(manifest["state_action_alignment"]["type"], "same_frame_timestamp")
             self.assertEqual(manifest["camera_keys"], ["observation.images.cam_head"])
             self.assertEqual(manifest["camera_columns"], ["observation_images_cam_head"])
+            self.assertEqual(
+                manifest["camera_key_to_column"],
+                {"observation.images.cam_head": "observation_images_cam_head"},
+            )
+            self.assertEqual(manifest["counts"]["episodes"], 2)
+            self.assertEqual(manifest["counts"]["frames"], 8)
+            self.assertEqual(manifest["counts"]["videos"], 2)
+            self.assertNotIn("media", manifest["counts"])
             self.assertEqual(manifest["state_dim"], 3)
             self.assertEqual(manifest["action_dim"], 3)
             self.assertNotIn(
@@ -197,6 +210,8 @@ class LerobotToLanceConversionTest(unittest.TestCase):
                 columns=[
                     "camera_name",
                     "media_type",
+                    "source_uri",
+                    "source_relative_path",
                     "relative_path",
                     "video_path",
                     "from_timestamp",
@@ -209,12 +224,23 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             ).to_table().to_pylist()[0]
             self.assertEqual(media_row["camera_name"], "observation.images.cam_head")
             self.assertEqual(media_row["media_type"], "video")
+            self.assertTrue(media_row["source_uri"].endswith("episode_000000.mp4"))
+            self.assertEqual(
+                media_row["source_relative_path"],
+                "videos/chunk-000/observation.images.cam_head/episode_000000.mp4",
+            )
             self.assertIsNone(media_row["video_path"])
             self.assertEqual(media_row["from_timestamp"], 0.0)
             self.assertAlmostEqual(media_row["to_timestamp"], 0.1)
             self.assertEqual(media_row["num_frames"], 4)
             self.assertEqual(media_row["width_pixels"], 320)
             self.assertEqual(media_row["height_pixels"], 240)
+
+            stats = json.loads((target / "meta" / "stats.json").read_text())
+            self.assertEqual(stats["observation.state"]["count"], [8, 8, 8])
+            self.assertEqual(stats["action"]["count"], [8, 8, 8])
+            tasks = json.loads((target / "meta" / "tasks.json").read_text())
+            self.assertEqual(tasks["tasks"][0]["language_instruction"], "pick-and-place")
 
     def test_refuses_existing_target_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -280,6 +306,8 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertTrue((target / "README.md").exists())
             self.assertTrue((target / "meta" / "info.json").exists())
             self.assertTrue((target / "meta" / "sessions.json").exists())
+            self.assertTrue((target / "meta" / "stats.json").exists())
+            self.assertTrue((target / "meta" / "tasks.json").exists())
             for name in ("episodes.lance", "frames.lance", "videos.lance"):
                 self.assertTrue((target / "data" / name).exists(), f"{name} missing")
             self.assertFalse((target / "media.lance").exists())
@@ -297,6 +325,12 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(manifest["tables"]["episodes"], "data/episodes.lance")
             self.assertEqual(manifest["tables"]["frames"], "data/frames.lance")
             self.assertEqual(manifest["tables"]["videos"], "data/videos.lance")
+            self.assertEqual(manifest["counts"]["episodes"], 2)
+            self.assertEqual(manifest["counts"]["frames"], 6)
+            self.assertEqual(manifest["counts"]["videos"], 2)
+            self.assertEqual(manifest["meta"]["stats"], "meta/stats.json")
+            self.assertEqual(manifest["stats"]["source_table"], "data/episodes.lance")
+            self.assertEqual(manifest["tasks"]["path"], "meta/tasks.json")
             self.assertEqual(manifest["total_episodes"], 2)
             self.assertEqual(manifest["total_frames"], 6)
             self.assertEqual(manifest["total_videos"], 2)

@@ -20,6 +20,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import re
 import shutil
 from pathlib import Path
@@ -115,6 +116,7 @@ def convert_lerobot_to_lance(
     episode_rows: list[dict[str, Any]] = []
     media_rows: list[dict[str, Any]] = []
     seen_video_paths: set[str] = set()
+    source_repo_id = _source_repo_id(info, source)
 
     total = len(episode_meta_rows)
     for ordinal, meta_row in enumerate(episode_meta_rows):
@@ -220,6 +222,7 @@ def convert_lerobot_to_lance(
                         camera_norm=camera_norm,
                         video_path=video_path,
                         source=source,
+                        source_repo_id=source_repo_id,
                         blob=blob,
                         episode_index=episode_index,
                         chunk_index=chunk_index,
@@ -257,6 +260,8 @@ def convert_lerobot_to_lance(
     target_meta = target / "meta"
     target_meta.mkdir(parents=True, exist_ok=True)
     (target_meta / "info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    _write_stats_json(target_meta, episode_rows)
+    _write_tasks_json(target_meta, task_lookup, episode_rows)
     _write_manifest(
         target,
         source=source,
@@ -273,13 +278,13 @@ def convert_lerobot_to_lance(
         media_written=len(media_rows),
         output_layout=output_layout,
         dataset_id=dataset_id,
-        source_repo_id=_source_repo_id(info, source),
+        source_repo_id=source_repo_id,
     )
     if output_layout == "hf":
         _write_hf_sessions_json(
             target,
             source=source,
-            source_repo_id=_source_repo_id(info, source),
+            source_repo_id=source_repo_id,
             layout=layout,
             episodes_written=len(episode_rows),
             frames_written=len(frame_rows) if include_frames else 0,
@@ -288,7 +293,7 @@ def convert_lerobot_to_lance(
         _write_hf_readme(
             target,
             dataset_id=dataset_id or target.name,
-            source_repo_id=_source_repo_id(info, source),
+            source_repo_id=source_repo_id,
             episodes_written=len(episode_rows),
             frames_written=len(frame_rows) if include_frames else 0,
             media_written=len(media_rows),
@@ -532,6 +537,7 @@ def _media_row(
     camera_norm: str,
     video_path: Path,
     source: Path,
+    source_repo_id: str | None,
     blob: bytes,
     episode_index: int,
     chunk_index: int,
@@ -541,6 +547,7 @@ def _media_row(
 ) -> dict[str, Any]:
     height, width = _video_shape(feature_info)
     rel = str(video_path.relative_to(source))
+    source_uri = _source_media_uri(source_repo_id, rel, video_path)
     return {
         "media_id": f"episode_{episode_index:06d}_{camera_norm}",
         "episode_id": f"episode_{episode_index:06d}",
@@ -548,6 +555,10 @@ def _media_row(
         "camera_id": camera_norm,
         "camera_name": camera_key,
         "media_type": "video",
+        "source_uri": source_uri,
+        "source_dataset_url": _hf_dataset_url(source_repo_id),
+        "source_media_id": f"episode_{episode_index:06d}_{camera_norm}",
+        "source_relative_path": rel,
         "uri": rel,
         "relative_path": rel,
         "video_path": None,
@@ -564,6 +575,106 @@ def _media_row(
         "file_index": int(episode_index),
         "video_blob": blob,
     }
+
+
+def _source_media_uri(source_repo_id: str | None, rel: str, video_path: Path) -> str:
+    if source_repo_id and "/" in source_repo_id:
+        return f"hf://datasets/{source_repo_id}/{rel}"
+    return str(video_path)
+
+
+def _hf_dataset_url(source_repo_id: str | None) -> str | None:
+    if source_repo_id and "/" in source_repo_id:
+        return f"https://huggingface.co/datasets/{source_repo_id}"
+    return None
+
+
+def _write_stats_json(meta_dir: Path, episode_rows: list[dict[str, Any]]) -> None:
+    states: list[list[float]] = []
+    actions: list[list[float]] = []
+    for row in episode_rows:
+        states.extend(_as_vector_rows(row.get("observation_state")))
+        actions.extend(_as_vector_rows(row.get("actions")))
+    stats = {
+        "observation.state": _vector_stats(states),
+        "action": _vector_stats(actions),
+    }
+    (meta_dir / "stats.json").write_text(
+        json.dumps(stats, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_tasks_json(
+    meta_dir: Path,
+    task_lookup: dict[int, str],
+    episode_rows: list[dict[str, Any]],
+) -> None:
+    task_counts: dict[int, int] = {}
+    task_texts: dict[int, str] = {int(k): str(v) for k, v in task_lookup.items()}
+    for row in episode_rows:
+        task_index = int(row.get("task_index") or 0)
+        task_counts[task_index] = task_counts.get(task_index, 0) + 1
+        language = row.get("language_instruction")
+        if isinstance(language, str) and language:
+            task_texts.setdefault(task_index, language)
+
+    payload = {
+        "schema_version": "1.0",
+        "tasks": [
+            {
+                "task_index": task_index,
+                "language_instruction": task_texts.get(task_index),
+                "episode_count": task_counts.get(task_index, 0),
+            }
+            for task_index in sorted(set(task_texts) | set(task_counts))
+        ],
+    }
+    (meta_dir / "tasks.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _as_vector_rows(value: Any) -> list[list[float]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[list[float]] = []
+    for item in value:
+        if isinstance(item, list):
+            rows.append([float(v) for v in item])
+    return rows
+
+
+def _vector_stats(vectors: list[list[float]]) -> dict[str, list[float]]:
+    if not vectors:
+        return {"mean": [], "std": [], "min": [], "max": [], "count": []}
+    dim = max(len(vector) for vector in vectors)
+    columns = [
+        [float(vector[index]) for vector in vectors if index < len(vector) and math.isfinite(float(vector[index]))]
+        for index in range(dim)
+    ]
+    means = [_mean(column) for column in columns]
+    return {
+        "mean": means,
+        "std": [_std(column, mean) for column, mean in zip(columns, means)],
+        "min": [min(column) if column else 0.0 for column in columns],
+        "max": [max(column) if column else 0.0 for column in columns],
+        "count": [len(column) for column in columns],
+    }
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _std(values: list[float], mean: float) -> float:
+    if len(values) <= 1:
+        return 0.0
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return math.sqrt(variance)
 
 
 def _write_manifest(
@@ -620,8 +731,26 @@ def _write_manifest(
             "state": "observation_state",
             "action": "actions",
         },
+        "frame_columns": {
+            "state": "observation_state",
+            "action": "action",
+        },
+        "state_action_alignment": {
+            "type": "same_frame_timestamp",
+            "episode_timestamp_column": "timestamps",
+            "frame_timestamp_column": "timestamp",
+            "state_episode_column": "observation_state",
+            "action_episode_column": "actions",
+            "state_frame_column": "observation_state",
+            "action_frame_column": "action",
+            "index_rule": (
+                "observation_state[i] and actions[i] are aligned to timestamps[i]; "
+                "the converter does not shift actions to the next state."
+            ),
+        },
         "camera_keys": camera_keys,
         "camera_columns": cameras_norm,
+        "camera_key_to_column": dict(zip(camera_keys, cameras_norm)),
         "fps": float(fps),
         "state_dim": int(state_dim),
         "action_dim": int(action_dim),
@@ -632,10 +761,35 @@ def _write_manifest(
             "videos" if is_hf else "media": "video_blob_column" if has_media else "absent",
         },
         "tables": tables,
+        "meta": {
+            "info": "meta/info.json",
+            "stats": "meta/stats.json",
+            "tasks": "meta/tasks.json",
+        },
+        "stats": {
+            "format": "lerobot_style_state_action_v1",
+            "path": "meta/stats.json",
+            "source_table": episodes_path,
+            "source_columns": {
+                "observation.state": "observation_state",
+                "action": "actions",
+            },
+            "features": ["observation.state", "action"],
+        },
+        "tasks": {
+            "path": "meta/tasks.json",
+            "task_index_column": "task_index",
+            "text_column": "language_instruction",
+        },
+        "media_path_columns": {
+            "relative_path": "relative_path",
+            "source_uri": "source_uri",
+            "deprecated_aliases": ["uri", "video_path"],
+        },
         "counts": {
             "episodes": int(episodes_written),
             "frames": int(frames_written),
-            "media": int(media_written),
+            "videos": int(media_written),
         },
         "total_episodes": int(episodes_written),
         "total_frames": int(frames_written),
@@ -649,6 +803,7 @@ def _write_manifest(
                 "total_video_segments": int(media_written),
             }
         )
+        manifest["meta"]["sessions"] = "meta/sessions.json"
     text = json.dumps(manifest, indent=2, sort_keys=True)
     (target / "manifest.json").write_text(text, encoding="utf-8")
 
@@ -796,6 +951,10 @@ def _build_media_schema(pa: Any) -> Any:
             pa.field("camera_id", pa.string()),
             pa.field("camera_name", pa.string(), nullable=False),
             pa.field("media_type", pa.string()),
+            pa.field("source_uri", pa.string()),
+            pa.field("source_dataset_url", pa.string()),
+            pa.field("source_media_id", pa.string()),
+            pa.field("source_relative_path", pa.string()),
             pa.field("uri", pa.string()),
             pa.field("relative_path", pa.string()),
             pa.field(

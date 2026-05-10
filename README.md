@@ -101,7 +101,9 @@ target/
   manifest.json           # rllab_published_lance_dataset_v1 contract
   README.md               # dataset card
   meta/
-    info.json            # copy of the source LeRobot info.json (used by viewers for codec metadata)
+    info.json             # copy of the source LeRobot info.json (used by viewers for codec metadata)
+    stats.json            # LeRobot-compatible observation.state/action normalization stats
+    tasks.json            # task_index -> language_instruction summary
     sessions.json         # provenance for this converted source dataset
   data/
     episodes.lance        # primary trajectory table, no *_video_blob columns
@@ -117,12 +119,14 @@ local `v1/v2` folders.
 
 ```text
 target/
-  manifest.json           # rllab_lance_session_v1 contract
+  manifest.json           # table paths, state/action alignment, media contract
   episodes.lance/         # primary trajectory table, no *_video_blob columns
   frames.lance/           # frame-level browsing/QA table
   media.lance/            # canonical media table with inline MP4 blobs
   meta/
     info.json             # copy of source LeRobot info.json
+    stats.json            # LeRobot-compatible state/action normalization stats
+    tasks.json            # task_index -> language_instruction summary
 ```
 
 `episodes.lance` columns:
@@ -142,11 +146,16 @@ target/
 
 Camera-name normalization: `observation.images.cam_head` → `observation_images_cam_head` (Lance column-name rules require underscore-only). The original dotted name stays in `meta/info.json` for viewer reference.
 
-`frames.lance` also includes `global_frame_index`, `state_norm`, `action_norm`, and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic statistics.
+`observation_state` is the robot observation at timestamp `timestamps[i]`.
+`actions` is the action/command vector aligned to the same timestamp index.
+The converter does not shift actions to the next state; this is recorded in
+`manifest.json.state_action_alignment.type = "same_frame_timestamp"`.
 
-The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) is the only place video bytes are stored. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `uri`, `relative_path`, `video_blob`, `video_path`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`.
+`frames.lance` also includes `global_frame_index`, `state_norm`, `action_norm`, and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic statistics. Its frame-level columns are `observation_state` and singular `action`; these are the frame-row expansion of episode-level `observation_state` and `actions`.
 
-`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `media_mode="videos_table"`, `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. `rllab-training`, `robo_dataview`, and the stack scripts resolve camera MP4s through the media table, so there is no second training-only video format.
+The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) is the only place video bytes are stored. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `relative_path`, `source_uri`, `source_dataset_url`, `video_blob`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`. `uri` and `video_path` are kept only as compatibility aliases; new readers should use `relative_path` and `source_uri`.
+
+`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `media_mode="videos_table"`, `training_columns`, `frame_columns`, `state_action_alignment`, `camera_keys`, `camera_columns`, `camera_key_to_column`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. The canonical row counts live under `counts.{episodes,frames,videos}`; older `total_*` fields remain as compatibility aliases. `rllab-training`, `robo_dataview`, and the stack scripts resolve camera MP4s through the media table, so there is no second training-only video format.
 
 ## 한국어 사용법
 
@@ -299,6 +308,8 @@ data/pretrain_aiworker_19d/
   data/train_episodes.lance
   data/frames.lance
   data/videos.lance
+  meta/stats.json
+  meta/tasks.json
   meta/sessions.json
   meta/sources.json
 ```
@@ -313,7 +324,7 @@ RLLAB Lance dataset: `episodes.lance` and `train_episodes.lance` contain no
 bytes. Rows are re-indexed into a single episode/frame space and keep
 provenance columns such as `source_dataset`, `source_repo_id`,
 `source_dataset_url`, `source_episode_index`, `source_robot_type`, and
-`pretrain_tier`. Media rows additionally keep `source_local_path`,
+`pretrain_tier`. Media rows additionally keep `source_uri`, `source_local_path`,
 `source_video_table`, `source_media_id`, and `source_relative_path`.
 
 Source repos whose names look like scratch/test uploads are excluded by default;
