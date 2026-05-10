@@ -1,4 +1,4 @@
-"""Convert a LeRobot v2.1 or v3.0 dataset on disk into a Lance session bundle
+"""Convert a LeRobot v2.1 or v3.0 dataset on disk into an RLLAB Lance bundle
 consumed by downstream Lance-native viewers and trainers.
 
 Both LeRobot layouts (v2.1 single-Parquet-per-episode, v3 sharded file
@@ -6,6 +6,12 @@ Parquets) are auto-detected and produce the same Lance bundle shape. The
 source `meta/info.json` is copied to the target so downstream tools can
 surface per-camera codec / pix_fmt / resolution metadata without re-reading
 the original LeRobot tree.
+
+The canonical media contract is intentionally singular: episode rows contain
+numeric/text trajectory data and camera timestamp ranges, while playable MP4
+bytes live in the media table (`media.lance` for flat local layout,
+`data/videos.lance` for HF/published layout). Episode-level `*_video_blob`
+columns are not written by this converter.
 """
 
 from __future__ import annotations
@@ -45,8 +51,7 @@ def convert_lerobot_to_lance(
     overwrite: bool = False,
     limit: int | None = None,
     include_frames: bool = True,
-    include_video_blobs: bool = True,
-    output_layout: str = "session",
+    output_layout: str = "hf",
     dataset_id: str | None = None,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -198,15 +203,10 @@ def convert_lerobot_to_lance(
                 meta_row,
             )
             if video_path is None or not video_path.exists():
-                episode_row[f"{camera_norm}_video_blob"] = None
                 episode_row[f"{camera_norm}_from_timestamp"] = None
                 episode_row[f"{camera_norm}_to_timestamp"] = None
                 continue
             blob = video_path.read_bytes()
-            if include_video_blobs:
-                episode_row[f"{camera_norm}_video_blob"] = blob
-            else:
-                episode_row[f"{camera_norm}_video_blob"] = None
             episode_row[f"{camera_norm}_from_timestamp"] = 0.0
             episode_row[f"{camera_norm}_to_timestamp"] = (len(ep_frames) - 1) / fps
 
@@ -625,10 +625,11 @@ def _write_manifest(
         "fps": float(fps),
         "state_dim": int(state_dim),
         "action_dim": int(action_dim),
-        "media_mode": "episode_blob",
+        "media_mode": "videos_table",
+        "camera_storage": "videos_table",
         "blob_storage": {
-            "episodes": "video_blob_columns",
-            "media": "video_blob_column" if has_media else "absent",
+            "episodes": "absent",
+            "videos" if is_hf else "media": "video_blob_column" if has_media else "absent",
         },
         "tables": tables,
         "counts": {
@@ -708,9 +709,9 @@ Lance-formatted LeRobot dataset converted from `{source_label}` with
 
 | Table | Purpose |
 | --- | --- |
-| `data/episodes.lance` | One row per episode: timestamps, state/action arrays, task text, and optional per-camera episode video blobs. |
+| `data/episodes.lance` | One row per episode: timestamps, state/action arrays, task text, and camera timestamp ranges. |
 | `data/frames.lance` | One row per frame for browsing, QA, and frame-level filtering. |
-| `data/videos.lance` | One row per source MP4 with inline video blob and media metadata. |
+| `data/videos.lance` | Canonical media table: one row per episode/camera MP4 with inline video blob and media metadata. |
 
 ## Summary
 
@@ -764,13 +765,6 @@ def _build_episodes_schema(pa: Any, cameras_norm: list[str]) -> Any:
         pa.field("language_instruction", pa.string()),
     ]
     for camera_norm in cameras_norm:
-        fields.append(
-            pa.field(
-                f"{camera_norm}_video_blob",
-                pa.large_binary(),
-                metadata={b"lance-encoding:blob": b"true"},
-            )
-        )
         fields.append(pa.field(f"{camera_norm}_from_timestamp", pa.float64()))
         fields.append(pa.field(f"{camera_norm}_to_timestamp", pa.float64()))
     return pa.schema(fields)

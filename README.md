@@ -69,10 +69,9 @@ Useful flags:
 |---|---|
 | `--overwrite` | Replace any existing `*.lance` directories under `--target` |
 | `--limit N` | Convert only the first N episodes (smoke testing) |
-| `--layout session\|hf` | `session` keeps the flat local bundle; `hf` writes `data/*.lance` under an HF repo root |
+| `--layout hf\|session` | `hf` is the standard published layout; `session` keeps a legacy flat local bundle |
 | `--dataset-id ID` | Stable dataset id recorded in `manifest.json`; defaults to target dir name for HF layout |
-| `--no-frames` | Skip writing `frames.lance` (saves disk if your trainer only reads `episodes.lance`) |
-| `--no-video-blobs` | Omit per-camera video blobs from `episodes.lance`; `media.lance` / `data/videos.lance` still has the raw MP4 rows |
+| `--no-frames` | Skip writing `frames.lance` |
 | `--upload --repo-id org/name` | Upload the HF-layout bundle to Hugging Face |
 | `--tag v0.1.0` | Create an HF git tag after upload |
 
@@ -95,37 +94,36 @@ A `progress_callback(kind, payload)` is invoked once per episode with `kind="epi
 
 ## Output bundle
 
-### Local session layout (default)
-
-```text
-target/
-  manifest.json           # rllab_lance_session_v1 contract for viewers/trainers
-  episodes.lance/        # one row per episode, includes per-camera *_video_blob columns
-  frames.lance/          # one row per frame: episode_index, frame_index, timestamp,
-                         # task_index, observation_state, action, QA norms/flags
-  media.lance/           # canonical media index with sha256 + raw bytes blob
-  meta/
-    info.json            # copy of the source LeRobot info.json (used by viewers for codec metadata)
-```
-
-### Hugging Face published layout (`--layout hf` or `--upload`)
+### Standard published layout (default, `--layout hf` or `--upload`)
 
 ```text
 target/
   manifest.json           # rllab_published_lance_dataset_v1 contract
   README.md               # dataset card
   meta/
-    info.json             # copy of source LeRobot info.json
+    info.json            # copy of the source LeRobot info.json (used by viewers for codec metadata)
     sessions.json         # provenance for this converted source dataset
   data/
-    episodes.lance        # primary training table
+    episodes.lance        # primary trajectory table, no *_video_blob columns
     frames.lance          # frame-level browsing/QA table
-    videos.lance          # canonical source MP4 table with inline blobs
+    videos.lance          # canonical media table with inline MP4 blobs
 ```
 
-This is the layout expected by the newer RLLAB stack and Hugging Face dataset
-repos. Version history should live in HF commits/branches/tags, not local
-`v1/v2` folders.
+This standard layout is expected by the newer RLLAB stack and Hugging Face
+dataset repos. Version history should live in HF commits/branches/tags, not
+local `v1/v2` folders.
+
+### Legacy flat session layout (`--layout session`)
+
+```text
+target/
+  manifest.json           # rllab_lance_session_v1 contract
+  episodes.lance/         # primary trajectory table, no *_video_blob columns
+  frames.lance/           # frame-level browsing/QA table
+  media.lance/            # canonical media table with inline MP4 blobs
+  meta/
+    info.json             # copy of source LeRobot info.json
+```
 
 `episodes.lance` columns:
 
@@ -139,7 +137,6 @@ repos. Version history should live in HF commits/branches/tags, not local
 | `observation_state` | list&lt;list&lt;float32&gt;&gt; | shape (T, state_dim) |
 | `actions` | list&lt;list&lt;float32&gt;&gt; | shape (T, action_dim) |
 | `language_instruction` | string | from `meta/tasks.jsonl` lookup |
-| `{camera_norm}_video_blob` | large_binary, blob-encoded | per-camera MP4 segment |
 | `{camera_norm}_from_timestamp` | float64 | always `0.0` for whole-episode segments |
 | `{camera_norm}_to_timestamp` | float64 | `(length - 1) / fps` |
 
@@ -147,9 +144,9 @@ Camera-name normalization: `observation.images.cam_head` → `observation_images
 
 `frames.lance` also includes `global_frame_index`, `state_norm`, `action_norm`, and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic statistics.
 
-The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `uri`, `relative_path`, `video_blob`, `video_path`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`.
+The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) is the only place video bytes are stored. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `uri`, `relative_path`, `video_blob`, `video_path`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`.
 
-`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `training_row_unit="episode"`, `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. This lets `rllab-training`, `robo_dataview`, and the stack scripts share one contract without extra CLI flags.
+`manifest.json` marks `episodes.lance` as the `primary_training_table`, records `media_mode="videos_table"`, `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. `rllab-training`, `robo_dataview`, and the stack scripts resolve camera MP4s through the media table, so there is no second training-only video format.
 
 ## 한국어 사용법
 
@@ -277,7 +274,7 @@ dataset:
   root: /tmp/ffw_lance
 ```
 
-`rllab_training.data.EpisodeDataset` reads the generated `manifest.json` and then uses `episodes.lance` as the primary training table — no further conversion step.
+`rllab_training.data.EpisodeDataset` reads the generated `manifest.json`, uses `episodes.lance` for state/action, and resolves MP4s through `media.lance` or `data/videos.lance` — no second conversion step.
 
 ## AI Worker / BG2 19D Pretraining Bundle
 
@@ -310,42 +307,33 @@ data/pretrain_aiworker_19d/
 and no video blob columns. `data/train_episodes.lance` is the rllab-training
 table named by `manifest.json.primary_training_table`.
 
-By default this is a light numeric/text pretraining bundle. It does not
-duplicate MP4 bytes; `data/train_episodes.lance` has no `*_video_blob` columns
-and `data/videos.lance` is a source media index with `video_blob = null` plus
-`source_local_path`, `source_video_table`, `source_media_id`, and
-`source_relative_path`. Rows are re-indexed into a single episode/frame space
-and keep provenance columns such as `source_dataset`, `source_repo_id`,
+The pretrain bundle uses the same single media contract as every other new
+RLLAB Lance dataset: `episodes.lance` and `train_episodes.lance` contain no
+`*_video_blob` columns, while `data/videos.lance.video_blob` stores the MP4
+bytes. Rows are re-indexed into a single episode/frame space and keep
+provenance columns such as `source_dataset`, `source_repo_id`,
 `source_dataset_url`, `source_episode_index`, `source_robot_type`, and
-`pretrain_tier`.
+`pretrain_tier`. Media rows additionally keep `source_local_path`,
+`source_video_table`, `source_media_id`, and `source_relative_path`.
 
 Source repos whose names look like scratch/test uploads are excluded by default;
 pass `--include-review-names` to include them. To build only strict BG2
 full-body data, add `--strict-bg2-only`.
 
-Current `rllab-training` image policies require camera blobs in the selected
-training table, and `robo_dataview` plays merged videos from `data/videos.lance`.
-For a self-contained publish/training bundle, build the heavier variant:
-
 ```bash
 PYTHONPATH=. ./.venv/bin/python scripts/build_pretrain_19d_lance.py \
   --converted-root data/converted_19d \
-  --output data/pretrain_aiworker_19d_train \
+  --output data/pretrain_aiworker_19d \
   --dataset-id rllab-postech/pretraining-aiworker-bg2-19d \
-  --copy-video-blobs \
   --overwrite
 ```
-
-`--copy-video-blobs` re-materializes MP4 bytes through Lance `take_blobs()`
-instead of copying the `{position, size}` blob handles returned by a normal
-Lance scan.
 
 ## Troubleshooting
 
 - **`FileNotFoundError: ... meta/info.json`** — `--source` doesn't look like a LeRobot dataset root. Check the directory contains `meta/info.json`, `data/`, and `videos/`.
 - **`FileNotFoundError: ... episodes`** — neither v3 sharded `meta/episodes/` nor v2.1 `meta/episodes.jsonl` was found. The dataset may use an unsupported layout; file an issue with the `info.json` snippet.
 - **`FileExistsError`** — pass `--overwrite` to replace existing `*.lance` tables in the target directory.
-- **Missing per-frame video metadata in `episodes.lance`** — the converter sets `from_timestamp=0.0` and `to_timestamp=(length-1)/fps` since the whole episode segment is embedded. Per-frame timestamps are in `frames.lance` (and the `timestamps` array on each episode row).
+- **No `*_video_blob` columns in `episodes.lance`** — this is expected. Video bytes belong to `media.lance` / `data/videos.lance`; episode rows only keep the trajectory arrays and timestamp ranges.
 - **HF auth on `hf://` source paths** — this tool reads from local paths only. Use `huggingface-cli download` (or `hf download`) to materialize the dataset locally first.
 
 ## Development

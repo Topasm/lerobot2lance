@@ -3,7 +3,7 @@
 Usage:
     lerobot2lance --source /path/to/lerobot/dataset \\
                   --target /path/to/output/lance_bundle \\
-                  [--overwrite] [--limit N] [--no-frames] [--no-video-blobs]
+                  [--overwrite] [--limit N] [--no-frames]
 """
 
 from __future__ import annotations
@@ -36,10 +36,11 @@ def main() -> int:
     parser.add_argument(
         "--layout",
         choices=("session", "hf"),
-        default="session",
+        default="hf",
         help=(
-            "Output layout. session writes flat local tables; hf writes "
-            "manifest/README/meta plus data/{episodes,frames,videos}.lance."
+            "Output layout. hf is the standard published layout with "
+            "manifest/README/meta plus data/{episodes,frames,videos}.lance; "
+            "session is a legacy flat local layout."
         ),
     )
     parser.add_argument(
@@ -48,14 +49,6 @@ def main() -> int:
         help="Stable dataset id written to manifest.json. Defaults to target dir name for --layout hf.",
     )
     parser.add_argument("--no-frames", action="store_true", help="Skip writing frames.lance")
-    parser.add_argument(
-        "--no-video-blobs",
-        action="store_true",
-        help=(
-            "Omit video blob columns from episodes.lance. The media table "
-            "(media.lance or data/videos.lance) still keeps source MP4 blobs."
-        ),
-    )
     parser.add_argument(
         "--upload",
         action="store_true",
@@ -85,7 +78,6 @@ def main() -> int:
         overwrite=args.overwrite,
         limit=args.limit,
         include_frames=not args.no_frames,
-        include_video_blobs=not args.no_video_blobs,
         output_layout=output_layout,
         dataset_id=dataset_id,
         progress_callback=_emit,

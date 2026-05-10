@@ -100,7 +100,19 @@ def slug_repo_id(repo_id: str) -> str:
 def target_is_done(target_dir: Path) -> bool:
     manifest = target_dir / "manifest.json"
     episodes = target_dir / "data" / "episodes.lance"
-    return manifest.exists() and episodes.exists()
+    videos = target_dir / "data" / "videos.lance"
+    if not (manifest.exists() and episodes.exists() and videos.exists()):
+        return False
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    blob_storage = payload.get("blob_storage") or {}
+    return (
+        payload.get("media_mode") == "videos_table"
+        and blob_storage.get("episodes") == "absent"
+        and blob_storage.get("videos") == "video_blob_column"
+    )
 
 
 def make_job(

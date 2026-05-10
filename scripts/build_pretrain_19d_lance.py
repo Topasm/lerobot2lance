@@ -14,12 +14,10 @@ episode/global frame indices so multiple source datasets can be trained as one
 dataset without index collisions. Source provenance is recorded both in row
 columns and in `meta/sessions.json` / README.md.
 
-By default this script does not copy Lance video blobs. Lance blob columns scan
-back as descriptor handles (for example {"position": 0, "size": 1234}), not raw
-bytes, so a training/pretrain merge should keep numeric/text trajectory data and
-point back to the source bundles for media. Use `--copy-video-blobs` only when
-you explicitly want a viewer bundle that re-materializes MP4 bytes with
-`Dataset.take_blobs()`.
+There is one media contract: trajectory tables contain numeric/text episode
+data, and `data/videos.lance` is the only MP4 store. The builder always
+re-materializes `data/videos.lance.video_blob` from source bundles and never
+writes `*_video_blob` columns into `episodes.lance` or `train_episodes.lance`.
 """
 
 from __future__ import annotations
@@ -52,20 +50,12 @@ def main() -> int:
         action="store_true",
         help="Include source repos whose names look like TEST/upload scratch data.",
     )
-    parser.add_argument(
-        "--copy-video-blobs",
-        action="store_true",
-        help=(
-            "Re-materialize episode/video blobs with Lance take_blobs(). "
-            "Default is source-reference media with no copied MP4 bytes."
-        ),
-    )
     parser.add_argument("--limit-sources", type=int, default=None)
     parser.add_argument(
         "--batch-size",
         type=int,
         default=8,
-        help="Rows per write batch. Keep modest when --copy-video-blobs is enabled.",
+        help="Rows per write batch.",
     )
     args = parser.parse_args()
 
@@ -95,16 +85,15 @@ def main() -> int:
     import pyarrow as pa
 
     source_camera_keys, source_camera_columns = union_cameras(sources)
-    camera_keys = source_camera_keys if args.copy_video_blobs else []
-    camera_columns = source_camera_columns if args.copy_video_blobs else []
+    camera_keys = source_camera_keys
+    camera_columns = source_camera_columns
     episodes_schema = build_episodes_schema(pa)
     train_episodes_schema = build_train_episodes_schema(
         pa,
         source_camera_columns,
-        include_video_blobs=args.copy_video_blobs,
     )
     frames_schema = build_frames_schema(pa)
-    videos_schema = build_videos_schema(pa, include_video_blobs=args.copy_video_blobs)
+    videos_schema = build_videos_schema(pa)
 
     sessions: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
@@ -146,9 +135,8 @@ def main() -> int:
                 sid,
                 emap,
                 source_camera_columns,
-                include_video_blobs=args.copy_video_blobs,
             ),
-            copy_blobs=args.copy_video_blobs,
+            copy_blobs=False,
         )
         if (bundle / "data" / "frames.lance").exists():
             local_frame_count = write_remapped_table(
@@ -177,9 +165,8 @@ def main() -> int:
                     n,
                     sid,
                     emap,
-                    include_video_blobs=args.copy_video_blobs,
                 ),
-                copy_blobs=args.copy_video_blobs,
+                copy_blobs=True,
             )
         else:
             local_video_count = 0
@@ -225,7 +212,6 @@ def main() -> int:
         episodes=episode_offset,
         frames=frame_offset,
         videos=video_count,
-        copy_video_blobs=args.copy_video_blobs,
     )
     write_json(output / "manifest.json", manifest)
     write_json(output / "meta" / "manifest.json", manifest)
@@ -242,7 +228,7 @@ def main() -> int:
                 "episodes": episode_offset,
                 "frames": frame_offset,
                 "videos": video_count,
-                "copy_video_blobs": bool(args.copy_video_blobs),
+                "media_mode": "videos_table",
                 "output": str(output),
             },
             indent=2,
@@ -403,7 +389,7 @@ def materialize_blobs(
             continue
         handle = handles[0]
         try:
-            row[column] = handle.readall()
+            row[column] = handle.readall() if hasattr(handle, "readall") else handle.read()
         finally:
             handle.close()
 
@@ -453,7 +439,6 @@ def transform_train_episode(
     source_id: int,
     episode_map: dict[int, int],
     camera_columns: list[str],
-    include_video_blobs: bool,
 ) -> dict[str, Any]:
     source_episode = int(row["episode_index"])
     out = {
@@ -477,8 +462,6 @@ def transform_train_episode(
         "quality_flag": source.get("quality_flag"),
     }
     for camera_column in camera_columns:
-        if include_video_blobs:
-            out[f"{camera_column}_video_blob"] = row.get(f"{camera_column}_video_blob")
         out[f"{camera_column}_from_timestamp"] = row.get(f"{camera_column}_from_timestamp")
         out[f"{camera_column}_to_timestamp"] = row.get(f"{camera_column}_to_timestamp")
     return out
@@ -522,7 +505,6 @@ def transform_video(
     source: dict[str, Any],
     source_id: int,
     episode_map: dict[int, int],
-    include_video_blobs: bool,
 ) -> dict[str, Any]:
     source_episode = int(row["episode_index"])
     episode_index = episode_map[source_episode]
@@ -536,7 +518,7 @@ def transform_video(
         "media_type": row.get("media_type"),
         "uri": row.get("uri"),
         "relative_path": row.get("relative_path"),
-        "video_blob": row.get("video_blob") if include_video_blobs else None,
+        "video_blob": row.get("video_blob"),
         "video_path": row.get("video_path"),
         "from_timestamp": row.get("from_timestamp"),
         "to_timestamp": row.get("to_timestamp"),
@@ -581,7 +563,7 @@ def build_episodes_schema(pa: Any) -> Any:
     )
 
 
-def build_train_episodes_schema(pa: Any, camera_columns: list[str], *, include_video_blobs: bool) -> Any:
+def build_train_episodes_schema(pa: Any, camera_columns: list[str]) -> Any:
     fields = [
         pa.field("episode_index", pa.int64(), nullable=False),
         pa.field("task_index", pa.int64()),
@@ -593,14 +575,6 @@ def build_train_episodes_schema(pa: Any, camera_columns: list[str], *, include_v
         pa.field("language_instruction", pa.string()),
     ]
     for camera_column in camera_columns:
-        if include_video_blobs:
-            fields.append(
-                pa.field(
-                    f"{camera_column}_video_blob",
-                    pa.large_binary(),
-                    metadata={b"lance-encoding:blob": b"true"},
-                )
-            )
         fields.extend(
             [
                 pa.field(f"{camera_column}_from_timestamp", pa.float64()),
@@ -629,11 +603,11 @@ def build_frames_schema(pa: Any) -> Any:
     )
 
 
-def build_videos_schema(pa: Any, *, include_video_blobs: bool) -> Any:
-    video_blob_field = (
-        pa.field("video_blob", pa.large_binary(), metadata={b"lance-encoding:blob": b"true"})
-        if include_video_blobs
-        else pa.field("video_blob", pa.large_binary())
+def build_videos_schema(pa: Any) -> Any:
+    video_blob_field = pa.field(
+        "video_blob",
+        pa.large_binary(),
+        metadata={b"lance-encoding:blob": b"true"},
     )
     return pa.schema(
         [
@@ -709,7 +683,6 @@ def build_manifest(
     episodes: int,
     frames: int,
     videos: int,
-    copy_video_blobs: bool,
 ) -> dict[str, Any]:
     fps_values = sorted({float(source["fps"]) for source in sources if source.get("fps") is not None})
     primary_fps = 10.0 if 10.0 in fps_values else (fps_values[0] if fps_values else None)
@@ -746,18 +719,14 @@ def build_manifest(
         "action_dim": 19,
         "source_camera_keys": source_camera_keys,
         "source_camera_columns": source_camera_columns,
-        "media_mode": "videos_table" if copy_video_blobs else "source_reference",
-        "training_ready": bool(copy_video_blobs),
-        "training_ready_notes": (
-            "Current rllab-training can read this bundle directly."
-            if copy_video_blobs
-            else "Image training with current rllab-training requires --copy-video-blobs or a source-reference media loader."
-        ),
+        "media_mode": "videos_table",
+        "camera_storage": "videos_table",
+        "training_ready": True,
+        "training_ready_notes": "rllab-training reads state/action from train_episodes.lance and MP4s from data/videos.lance.",
         "blob_storage": {
-            "episodes": "metadata_only",
-            "train_episodes": "video_blob_columns" if copy_video_blobs else "metadata_only_source_reference",
-            "videos": "video_blob_column" if copy_video_blobs and videos else "null_source_reference",
-            "source_reference": None if copy_video_blobs else "meta/sources.json + data/videos.lance source_* columns",
+            "episodes": "absent",
+            "train_episodes": "absent",
+            "videos": "video_blob_column",
         },
         "tables": {
             "episodes": {"path": "data/episodes.lance", "exists": True},
@@ -841,9 +810,9 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
         "| Table | Purpose |",
         "| --- | --- |",
         "| `data/episodes.lance` | Published episode table, one row per episode, no video blob columns. |",
-        "| `data/train_episodes.lance` | Training table named by `manifest.json.primary_training_table`; video blobs are present only with `--copy-video-blobs`. |",
+        "| `data/train_episodes.lance` | Training trajectory table named by `manifest.json.primary_training_table`; no video blob columns. |",
         "| `data/frames.lance` | Frame-level QA/index table with remapped global frame indices. |",
-        "| `data/videos.lance` | Source media index. `video_blob` is null unless built with `--copy-video-blobs`. |",
+        "| `data/videos.lance` | Canonical media table; `video_blob` stores one MP4 per episode/camera. |",
         "",
         "## Summary",
         "",
@@ -857,13 +826,14 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
         f"- Training ready for current rllab-training: {manifest['training_ready']}",
         f"- Episode blob storage: {manifest['blob_storage']['episodes']}",
         f"- Train episode blob storage: {manifest['blob_storage']['train_episodes']}",
+        f"- Video table blob storage: {manifest['blob_storage']['videos']}",
         "",
-        "By default the merged bundle does not duplicate MP4 bytes. Each Lance row",
+        "Each Lance row",
         "carries provenance columns such as `source_dataset`, `source_repo_id`,",
         "`source_dataset_url`, `source_local_path`, `source_episode_index`,",
         "`source_robot_type`, and `pretrain_tier`. `data/videos.lance` also keeps",
-        "`source_video_table`, `source_media_id`, and `source_relative_path` so a",
-        "viewer can resolve media from the original converted bundles.",
+        "`source_video_table`, `source_media_id`, and `source_relative_path` while",
+        "storing the canonical copied MP4 blob used by viewers and training.",
         "",
         "## Sources",
         "",

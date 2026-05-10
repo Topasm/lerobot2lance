@@ -128,6 +128,7 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             report = convert_lerobot_to_lance(
                 source,
                 target,
+                output_layout="session",
                 progress_callback=lambda kind, payload: events.append((kind, payload)),
             )
 
@@ -160,6 +161,9 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["format"], "rllab_lance_session_v1")
             self.assertEqual(manifest["primary_training_table"], "episodes.lance")
+            self.assertEqual(manifest["media_mode"], "videos_table")
+            self.assertEqual(manifest["blob_storage"]["episodes"], "absent")
+            self.assertEqual(manifest["blob_storage"]["media"], "video_blob_column")
             self.assertEqual(manifest["training_row_unit"], "episode")
             self.assertEqual(manifest["training_index_column"], "episode_index")
             self.assertIsNone(manifest["source_episode_column"])
@@ -170,6 +174,10 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(manifest["camera_columns"], ["observation_images_cam_head"])
             self.assertEqual(manifest["state_dim"], 3)
             self.assertEqual(manifest["action_dim"], 3)
+            self.assertNotIn(
+                "observation_images_cam_head_video_blob",
+                ds.schema.names,
+            )
 
             frames = lance.dataset(str(target / "frames.lance"))
             frame = frames.scanner(
@@ -232,28 +240,26 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(report["frames_written"], 2)
             self.assertEqual(report["media_written"], 1)
 
-    def test_no_video_blobs_omits_blob_payload(self) -> None:
+    def test_episode_table_never_stores_video_blobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "lerobot"
             target = Path(tmpdir) / "lance"
             _write_v2_1_dataset(source)
 
-            convert_lerobot_to_lance(source, target, include_video_blobs=False)
+            convert_lerobot_to_lance(source, target)
 
             import lance
 
-            ds = lance.dataset(str(target / "episodes.lance"))
-            row = ds.scanner(
-                columns=["observation_images_cam_head_video_blob"], limit=1
-            ).to_table().to_pylist()[0]
-            handle = row["observation_images_cam_head_video_blob"]
-            # Lance blob columns surface as a {position, size} handle even when
-            # the underlying payload is omitted; size==0 confirms no blob bytes
-            # were written.
-            if handle is not None:
-                self.assertEqual(handle.get("size", 0), 0)
-            media = lance.dataset(str(target / "media.lance"))
+            ds = lance.dataset(str(target / "data" / "episodes.lance"))
+            self.assertNotIn("observation_images_cam_head_video_blob", ds.schema.names)
+            media = lance.dataset(str(target / "data" / "videos.lance"))
             self.assertEqual(media.count_rows(), 2)
+            media_row = (
+                media.scanner(columns=["video_blob"], limit=1)
+                .to_table()
+                .to_pylist()[0]
+            )
+            self.assertTrue(media_row["video_blob"])
 
     def test_hf_layout_writes_data_tables_and_card(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -284,6 +290,10 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(manifest["published_data_dir"], "data")
             self.assertEqual(manifest["dataset_id"], "rllab-postech/bg2-test")
             self.assertEqual(manifest["primary_training_table"], "data/episodes.lance")
+            self.assertEqual(manifest["media_mode"], "videos_table")
+            self.assertEqual(manifest["camera_storage"], "videos_table")
+            self.assertEqual(manifest["blob_storage"]["episodes"], "absent")
+            self.assertEqual(manifest["blob_storage"]["videos"], "video_blob_column")
             self.assertEqual(manifest["tables"]["episodes"], "data/episodes.lance")
             self.assertEqual(manifest["tables"]["frames"], "data/frames.lance")
             self.assertEqual(manifest["tables"]["videos"], "data/videos.lance")
@@ -296,6 +306,10 @@ class LerobotToLanceConversionTest(unittest.TestCase):
 
             episodes = lance.dataset(str(target / "data" / "episodes.lance"))
             self.assertEqual(episodes.count_rows(), 2)
+            self.assertNotIn(
+                "observation_images_cam_head_video_blob",
+                episodes.schema.names,
+            )
             videos = lance.dataset(str(target / "data" / "videos.lance"))
             self.assertEqual(videos.count_rows(), 2)
             sessions = json.loads((target / "meta" / "sessions.json").read_text())

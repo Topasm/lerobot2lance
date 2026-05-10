@@ -186,7 +186,7 @@ def _write_converted_19d_bundle(
 
 @unittest.skipUnless(HAS_LANCE_DEPS, "requires pyarrow + lance")
 class PretrainBuilderTest(unittest.TestCase):
-    def test_default_merge_keeps_source_media_references_without_blobs(self) -> None:
+    def test_merge_writes_single_videos_table_media_contract(self) -> None:
         with self.subTest("build"):
             import tempfile
 
@@ -222,15 +222,19 @@ class PretrainBuilderTest(unittest.TestCase):
                 )
 
                 manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-                self.assertEqual(manifest["media_mode"], "source_reference")
-                self.assertFalse(manifest["training_ready"])
+                self.assertEqual(manifest["media_mode"], "videos_table")
+                self.assertTrue(manifest["training_ready"])
                 self.assertEqual(manifest["primary_training_table"], "data/train_episodes.lance")
-                self.assertEqual(manifest["blob_storage"]["episodes"], "metadata_only")
+                self.assertEqual(manifest["blob_storage"]["episodes"], "absent")
+                self.assertEqual(manifest["blob_storage"]["train_episodes"], "absent")
+                self.assertEqual(manifest["blob_storage"]["videos"], "video_blob_column")
                 self.assertEqual(
-                    manifest["blob_storage"]["train_episodes"],
-                    "metadata_only_source_reference",
+                    manifest["camera_keys"],
+                    [
+                        "observation.images.cam_head",
+                        "observation.images.cam_wrist_left",
+                    ],
                 )
-                self.assertEqual(manifest["camera_keys"], [])
                 self.assertEqual(
                     manifest["source_camera_keys"],
                     [
@@ -254,7 +258,6 @@ class PretrainBuilderTest(unittest.TestCase):
                 videos = lance.dataset(str(out / "data" / "videos.lance"))
                 row = videos.scanner(
                     columns=[
-                        "video_blob",
                         "source_dataset_url",
                         "source_video_table",
                         "source_media_id",
@@ -262,67 +265,11 @@ class PretrainBuilderTest(unittest.TestCase):
                     ],
                     limit=1,
                 ).to_table().to_pylist()[0]
-                self.assertIsNone(row["video_blob"])
+                video_blob = _read_blob(videos, "video_blob")
+                self.assertEqual(video_blob, b"abc")
                 self.assertEqual(row["source_dataset_url"], "https://huggingface.co/datasets/Org/A")
                 self.assertTrue(row["source_video_table"].endswith("/data/videos.lance"))
                 self.assertEqual(row["source_relative_path"], "videos/episode_000000.mp4")
-
-    def test_copy_video_blobs_writes_training_and_viewer_media_blobs(self) -> None:
-        with self.subTest("build"):
-            import tempfile
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp = Path(tmpdir)
-                converted = tmp / "converted_19d"
-                _write_converted_19d_bundle(
-                    converted,
-                    name="a",
-                    repo_id="Org/A",
-                    camera_key="observation.images.cam_head",
-                    camera_column="observation_images_cam_head",
-                )
-                out = tmp / "pretrain"
-                subprocess.run(
-                    [
-                        sys.executable,
-                        "scripts/build_pretrain_19d_lance.py",
-                        "--converted-root",
-                        str(converted),
-                        "--output",
-                        str(out),
-                        "--copy-video-blobs",
-                    ],
-                    check=True,
-                    cwd=Path(__file__).resolve().parents[1],
-                )
-
-                manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-                self.assertTrue(manifest["training_ready"])
-                self.assertEqual(manifest["media_mode"], "videos_table")
-                self.assertEqual(manifest["camera_keys"], ["observation.images.cam_head"])
-                self.assertEqual(manifest["blob_storage"]["episodes"], "metadata_only")
-                self.assertEqual(manifest["blob_storage"]["train_episodes"], "video_blob_columns")
-                self.assertEqual(manifest["blob_storage"]["videos"], "video_blob_column")
-
-                episodes = lance.dataset(str(out / "data" / "episodes.lance"))
-                self.assertFalse(
-                    any(name.endswith("_video_blob") for name in episodes.schema.names)
-                )
-
-                train_episodes = lance.dataset(str(out / "data" / "train_episodes.lance"))
-                self.assertIn(
-                    "observation_images_cam_head_video_blob",
-                    train_episodes.schema.names,
-                )
-                train_blob = _read_blob(
-                    train_episodes,
-                    "observation_images_cam_head_video_blob",
-                )
-                self.assertEqual(train_blob, b"abc")
-
-                videos = lance.dataset(str(out / "data" / "videos.lance"))
-                video_blob = _read_blob(videos, "video_blob")
-                self.assertEqual(video_blob, b"abc")
 
 
 def _read_blob(ds: object, column: str, index: int = 0) -> bytes:
