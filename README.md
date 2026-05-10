@@ -19,7 +19,8 @@ cd lerobot2lance
 pip install -e ".[dev]"
 ```
 
-Hard dependencies: `pyarrow>=16.0`, `pylance>=0.18`. Nothing else.
+Hard dependencies: `pyarrow>=16.0`, `pylance>=0.18`. Upload support is optional:
+install `.[hub]` when you want `--upload`.
 
 ## Quick Start
 
@@ -38,14 +39,42 @@ lerobot2lance \
   --overwrite
 ```
 
+To create the Hugging Face / RLLAB published layout directly:
+
+```bash
+lerobot2lance \
+  --source data/lerobot/ffw_bg2_rev4_pick-place \
+  --target data/published/bg2-grasp-v1 \
+  --layout hf \
+  --dataset-id bg2-grasp-v1 \
+  --overwrite
+```
+
+To convert and upload in one command:
+
+```bash
+RLLAB_HF_NAMESPACE=rllab-postech \
+lerobot2lance \
+  --source data/lerobot/ffw_bg2_rev4_pick-place \
+  --target data/published/bg2-grasp-v1 \
+  --dataset-id bg2-grasp-v1 \
+  --upload \
+  --tag v0.1.0 \
+  --overwrite
+```
+
 Useful flags:
 
 | Flag | Effect |
 |---|---|
 | `--overwrite` | Replace any existing `*.lance` directories under `--target` |
 | `--limit N` | Convert only the first N episodes (smoke testing) |
+| `--layout session\|hf` | `session` keeps the flat local bundle; `hf` writes `data/*.lance` under an HF repo root |
+| `--dataset-id ID` | Stable dataset id recorded in `manifest.json`; defaults to target dir name for HF layout |
 | `--no-frames` | Skip writing `frames.lance` (saves disk if your trainer only reads `episodes.lance`) |
-| `--no-video-blobs` | Omit per-camera video blobs from `episodes.lance` (`media.lance` still has the raw MP4 rows) |
+| `--no-video-blobs` | Omit per-camera video blobs from `episodes.lance`; `media.lance` / `data/videos.lance` still has the raw MP4 rows |
+| `--upload --repo-id org/name` | Upload the HF-layout bundle to Hugging Face |
+| `--tag v0.1.0` | Create an HF git tag after upload |
 
 ### Python API
 
@@ -66,6 +95,8 @@ A `progress_callback(kind, payload)` is invoked once per episode with `kind="epi
 
 ## Output bundle
 
+### Local session layout (default)
+
 ```text
 target/
   manifest.json           # rllab_lance_session_v1 contract for viewers/trainers
@@ -76,6 +107,25 @@ target/
   meta/
     info.json            # copy of the source LeRobot info.json (used by viewers for codec metadata)
 ```
+
+### Hugging Face published layout (`--layout hf` or `--upload`)
+
+```text
+target/
+  manifest.json           # rllab_lance_dataset_v1 contract
+  README.md               # dataset card
+  meta/
+    info.json             # copy of source LeRobot info.json
+    sessions.json         # provenance for this converted source dataset
+  data/
+    episodes.lance        # primary training table
+    frames.lance          # frame-level browsing/QA table
+    videos.lance          # canonical source MP4 table with inline blobs
+```
+
+This is the layout expected by the newer RLLAB stack and Hugging Face dataset
+repos. Version history should live in HF commits/branches/tags, not local
+`v1/v2` folders.
 
 `episodes.lance` columns:
 
@@ -133,6 +183,35 @@ output_lance_session/
 ```
 
 `episodes.lance`가 기본 학습 테이블입니다. Dataview에서 skill clip을 자르고 export하면, 그 curated export 쪽에서 `train_skill_clips.lance`가 생성됩니다. `lerobot2lance`는 LeRobot raw dataset을 raw Lance session으로 바꾸는 도구라서 `skills.lance`나 `train_skill_clips.lance`를 만들지 않습니다.
+
+### HF 공개용 포맷과 업로드
+
+RLLAB stack의 `data/published/<dataset_id>`와 같은 구조로 바로 만들려면:
+
+```bash
+lerobot2lance \
+  --source /path/to/lerobot_dataset \
+  --target /path/to/data/published/bg2-grasp-v1 \
+  --layout hf \
+  --dataset-id bg2-grasp-v1 \
+  --overwrite
+```
+
+업로드까지 한 번에:
+
+```bash
+RLLAB_HF_NAMESPACE=rllab-postech \
+lerobot2lance \
+  --source /path/to/lerobot_dataset \
+  --target /path/to/data/published/bg2-grasp-v1 \
+  --dataset-id bg2-grasp-v1 \
+  --upload \
+  --tag v0.1.0 \
+  --overwrite
+```
+
+`--upload`은 `huggingface_hub`가 필요합니다. 개발 환경에서는
+`pip install -e ".[dev,hub]"`로 설치하면 됩니다.
 
 ### 확인
 

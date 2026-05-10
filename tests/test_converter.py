@@ -255,6 +255,49 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             media = lance.dataset(str(target / "media.lance"))
             self.assertEqual(media.count_rows(), 2)
 
+    def test_hf_layout_writes_data_tables_and_card(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "lerobot"
+            target = Path(tmpdir) / "published"
+            _write_v2_1_dataset(source, episodes=2, length=3)
+
+            report = convert_lerobot_to_lance(
+                source,
+                target,
+                output_layout="hf",
+                dataset_id="rllab-postech/bg2-test",
+            )
+
+            self.assertEqual(report["output_layout"], "hf")
+            self.assertEqual(report["dataset_id"], "rllab-postech/bg2-test")
+            self.assertTrue((target / "manifest.json").exists())
+            self.assertTrue((target / "README.md").exists())
+            self.assertTrue((target / "meta" / "info.json").exists())
+            self.assertTrue((target / "meta" / "sessions.json").exists())
+            for name in ("episodes.lance", "frames.lance", "videos.lance"):
+                self.assertTrue((target / "data" / name).exists(), f"{name} missing")
+            self.assertFalse((target / "media.lance").exists())
+
+            manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["format"], "rllab_lance_dataset_v1")
+            self.assertEqual(manifest["dataset_id"], "rllab-postech/bg2-test")
+            self.assertEqual(manifest["primary_training_table"], "data/episodes.lance")
+            self.assertEqual(manifest["tables"]["episodes"], "data/episodes.lance")
+            self.assertEqual(manifest["tables"]["frames"], "data/frames.lance")
+            self.assertEqual(manifest["tables"]["videos"], "data/videos.lance")
+            self.assertEqual(manifest["total_episodes"], 2)
+            self.assertEqual(manifest["total_frames"], 6)
+            self.assertEqual(manifest["total_videos"], 2)
+
+            import lance
+
+            episodes = lance.dataset(str(target / "data" / "episodes.lance"))
+            self.assertEqual(episodes.count_rows(), 2)
+            videos = lance.dataset(str(target / "data" / "videos.lance"))
+            self.assertEqual(videos.count_rows(), 2)
+            sessions = json.loads((target / "meta" / "sessions.json").read_text())
+            self.assertEqual(sessions[0]["episodes"], 2)
+
 
 class ErrorPathTest(unittest.TestCase):
     def test_missing_source_raises(self) -> None:

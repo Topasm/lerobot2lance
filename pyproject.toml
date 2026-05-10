@@ -18,6 +18,9 @@ dependencies = [
 dev = [
   "pytest>=8.0.0",
 ]
+hub = [
+  "huggingface_hub>=0.23.0",
+]
 
 [project.scripts]
 lerobot2lance = "lerobot2lance.cli:main"

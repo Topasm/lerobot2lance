@@ -23,6 +23,8 @@ from typing import Any
 CONVERSION_REPORT_KEYS = (
     "source",
     "target",
+    "output_layout",
+    "dataset_id",
     "layout_detected",
     "episodes_written",
     "frames_written",
@@ -40,6 +42,8 @@ def convert_lerobot_to_lance(
     limit: int | None = None,
     include_frames: bool = True,
     include_video_blobs: bool = True,
+    output_layout: str = "session",
+    dataset_id: str | None = None,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Read a LeRobot dataset rooted at ``source`` and write a Lance bundle
@@ -47,6 +51,9 @@ def convert_lerobot_to_lance(
 
     source = Path(source)
     target = Path(target)
+    output_layout = output_layout.lower().replace("-", "_")
+    if output_layout not in {"session", "hf"}:
+        raise ValueError("output_layout must be 'session' or 'hf'")
     if not source.exists():
         raise FileNotFoundError(f"Source dataset not found: {source}")
 
@@ -74,15 +81,23 @@ def convert_lerobot_to_lance(
     if not episode_meta_rows:
         raise ValueError("No episode metadata rows found in source dataset")
 
+    table_root = target / "data" if output_layout == "hf" else target
+    video_table_name = "videos.lance" if output_layout == "hf" else "media.lance"
     stale_table_names = ("episodes.lance", "frames.lance", "media.lance", "videos.lance")
-    if any((target / name).exists() for name in stale_table_names):
+    stale_roots = [table_root]
+    alternate_root = target if output_layout == "hf" else target / "data"
+    if alternate_root != table_root:
+        stale_roots.append(alternate_root)
+    if any((root / name).exists() for root in stale_roots for name in stale_table_names):
         if not overwrite:
             raise FileExistsError(
                 f"Target already contains Lance tables (use overwrite=True): {target}"
             )
-        for name in stale_table_names:
-            shutil.rmtree(target / name, ignore_errors=True)
+        for root in stale_roots:
+            for name in stale_table_names:
+                shutil.rmtree(root / name, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
+    table_root.mkdir(parents=True, exist_ok=True)
 
     chunks_size = int(info.get("chunks_size") or 1000) or 1000
     cameras_norm = [_normalize_camera_key(key) for key in camera_keys]
@@ -223,17 +238,17 @@ def convert_lerobot_to_lance(
 
     episodes_schema = _build_episodes_schema(pa, cameras_norm)
     episodes_table = pa.Table.from_pylist(episode_rows, schema=episodes_schema)
-    lance.write_dataset(episodes_table, str(target / "episodes.lance"), mode="overwrite")
+    lance.write_dataset(episodes_table, str(table_root / "episodes.lance"), mode="overwrite")
 
     if include_frames and frame_rows:
         frames_schema = _build_frames_schema(pa)
         frames_table = pa.Table.from_pylist(frame_rows, schema=frames_schema)
-        lance.write_dataset(frames_table, str(target / "frames.lance"), mode="overwrite")
+        lance.write_dataset(frames_table, str(table_root / "frames.lance"), mode="overwrite")
 
     if media_rows:
         media_schema = _build_media_schema(pa)
         media_table = pa.Table.from_pylist(media_rows, schema=media_schema)
-        lance.write_dataset(media_table, str(target / "media.lance"), mode="overwrite")
+        lance.write_dataset(media_table, str(table_root / video_table_name), mode="overwrite")
 
     target_meta = target / "meta"
     target_meta.mkdir(parents=True, exist_ok=True)
@@ -252,11 +267,36 @@ def convert_lerobot_to_lance(
         episodes_written=len(episode_rows),
         frames_written=len(frame_rows) if include_frames else 0,
         media_written=len(media_rows),
+        output_layout=output_layout,
+        dataset_id=dataset_id,
+        source_repo_id=_source_repo_id(info, source),
     )
+    if output_layout == "hf":
+        _write_hf_sessions_json(
+            target,
+            source=source,
+            source_repo_id=_source_repo_id(info, source),
+            layout=layout,
+            episodes_written=len(episode_rows),
+            frames_written=len(frame_rows) if include_frames else 0,
+            media_written=len(media_rows),
+        )
+        _write_hf_readme(
+            target,
+            dataset_id=dataset_id or target.name,
+            source_repo_id=_source_repo_id(info, source),
+            episodes_written=len(episode_rows),
+            frames_written=len(frame_rows) if include_frames else 0,
+            media_written=len(media_rows),
+            fps=fps,
+            camera_keys=camera_keys,
+        )
 
     return {
         "source": str(source),
         "target": str(target),
+        "output_layout": output_layout,
+        "dataset_id": dataset_id,
         "layout_detected": layout,
         "episodes_written": len(episode_rows),
         "frames_written": len(frame_rows) if include_frames else 0,
@@ -537,29 +577,39 @@ def _write_manifest(
     episodes_written: int,
     frames_written: int,
     media_written: int,
+    output_layout: str,
+    dataset_id: str | None,
+    source_repo_id: str | None,
 ) -> None:
+    is_hf = output_layout == "hf"
+    episodes_path = "data/episodes.lance" if is_hf else "episodes.lance"
+    frames_path = "data/frames.lance" if is_hf else "frames.lance"
+    media_path = "data/videos.lance" if is_hf else "media.lance"
     tables = {
-        "episodes": "episodes.lance",
-        "primary_training": "episodes.lance",
+        "episodes": episodes_path,
+        "primary_training": episodes_path,
     }
     if include_frames:
-        tables["frames"] = "frames.lance"
+        tables["frames"] = frames_path
     if has_media:
-        tables["media"] = "media.lance"
+        tables["videos" if is_hf else "media"] = media_path
 
     manifest = {
-        "format": "rllab_lance_session_v1",
+        "format": "rllab_lance_dataset_v1" if is_hf else "rllab_lance_session_v1",
         "schema_version": "1.0",
         "source_format": f"lerobot_{layout}",
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "dataset_id": dataset_id,
         "source": str(source),
-        "primary_training_table": "episodes.lance",
+        "source_dataset": source_repo_id,
+        "source_session_count": 1,
+        "primary_training_table": episodes_path,
         "training_row_unit": "episode",
         "training_index_column": "episode_index",
         "source_episode_column": None,
         "video_frame_offset_column": None,
-        "frame_table": "frames.lance" if include_frames else None,
-        "media_table": "media.lance" if has_media else None,
+        "frame_table": frames_path if include_frames else None,
+        "media_table": media_path if has_media else None,
         "state_column": "observation_state",
         "action_column": "actions",
         "training_columns": {
@@ -582,9 +632,86 @@ def _write_manifest(
             "frames": int(frames_written),
             "media": int(media_written),
         },
+        "total_episodes": int(episodes_written),
+        "total_frames": int(frames_written),
+        "total_videos": int(media_written),
     }
     text = json.dumps(manifest, indent=2, sort_keys=True)
     (target / "manifest.json").write_text(text, encoding="utf-8")
+
+
+def _source_repo_id(info: dict[str, Any], source: Path) -> str | None:
+    for key in ("repo_id", "dataset_repo_id", "hf_repo_id"):
+        value = info.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return source.name if source.name else None
+
+
+def _write_hf_sessions_json(
+    target: Path,
+    *,
+    source: Path,
+    source_repo_id: str | None,
+    layout: str,
+    episodes_written: int,
+    frames_written: int,
+    media_written: int,
+) -> None:
+    payload = [
+        {
+            "source_format": f"lerobot_{layout}",
+            "source": str(source),
+            "source_dataset": source_repo_id,
+            "episodes": int(episodes_written),
+            "frames": int(frames_written),
+            "videos": int(media_written),
+        }
+    ]
+    (target / "meta" / "sessions.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _write_hf_readme(
+    target: Path,
+    *,
+    dataset_id: str,
+    source_repo_id: str | None,
+    episodes_written: int,
+    frames_written: int,
+    media_written: int,
+    fps: float,
+    camera_keys: list[str],
+) -> None:
+    source_label = source_repo_id or "local LeRobot dataset"
+    camera_text = ", ".join(camera_keys) if camera_keys else "none"
+    text = f"""# {dataset_id}
+
+Lance-formatted LeRobot dataset converted from `{source_label}` with
+`lerobot2lance`.
+
+## Tables
+
+| Table | Purpose |
+| --- | --- |
+| `data/episodes.lance` | One row per episode: timestamps, state/action arrays, task text, and optional per-camera episode video blobs. |
+| `data/frames.lance` | One row per frame for browsing, QA, and frame-level filtering. |
+| `data/videos.lance` | One row per source MP4 with inline video blob and media metadata. |
+
+## Summary
+
+- Episodes: {episodes_written}
+- Frames: {frames_written}
+- Videos: {media_written}
+- FPS: {fps:g}
+- Cameras: {camera_text}
+
+`manifest.json` records the table paths and training contract. Version history
+should be managed with Hugging Face commits, branches, and tags.
+"""
+    (target / "README.md").write_text(text, encoding="utf-8")
 
 
 def _caption_from_meta_tasks(row: dict[str, Any]) -> str | None:
