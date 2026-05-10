@@ -21,6 +21,9 @@ env/
 .coverage
 htmlcov/
 
+# Local datasets / conversion outputs
+data/
+
 # Editor / OS
 .vscode/
 .idea/
