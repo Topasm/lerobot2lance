@@ -112,7 +112,7 @@ target/
 
 ```text
 target/
-  manifest.json           # rllab_lance_dataset_v1 contract
+  manifest.json           # rllab_published_lance_dataset_v1 contract
   README.md               # dataset card
   meta/
     info.json             # copy of source LeRobot info.json
@@ -147,7 +147,7 @@ Camera-name normalization: `observation.images.cam_head` → `observation_images
 
 `frames.lance` also includes `global_frame_index`, `state_norm`, `action_norm`, and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic statistics.
 
-`media.lance` is the canonical media table. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `uri`, `relative_path`, `video_blob`, `video_path`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`.
+The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `uri`, `relative_path`, `video_blob`, `video_path`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`.
 
 `manifest.json` marks `episodes.lance` as the `primary_training_table`, records `training_row_unit="episode"`, `training_columns`, `camera_keys`, `camera_columns`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. This lets `rllab-training`, `robo_dataview`, and the stack scripts share one contract without extra CLI flags.
 

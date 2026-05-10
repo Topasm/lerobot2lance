@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import Any
 
 
+RLLAB_SESSION_FORMAT = "rllab_lance_session_v1"
+RLLAB_PUBLISHED_FORMAT = "rllab_published_lance_dataset_v1"
+RLLAB_PUBLISHED_LAYOUT = "rllab_published_dataset_v1"
+
 CONVERSION_REPORT_KEYS = (
     "source",
     "target",
@@ -595,7 +599,7 @@ def _write_manifest(
         tables["videos" if is_hf else "media"] = media_path
 
     manifest = {
-        "format": "rllab_lance_dataset_v1" if is_hf else "rllab_lance_session_v1",
+        "format": RLLAB_PUBLISHED_FORMAT if is_hf else RLLAB_SESSION_FORMAT,
         "schema_version": "1.0",
         "source_format": f"lerobot_{layout}",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -636,6 +640,14 @@ def _write_manifest(
         "total_frames": int(frames_written),
         "total_videos": int(media_written),
     }
+    if is_hf:
+        manifest.update(
+            {
+                "published_layout": RLLAB_PUBLISHED_LAYOUT,
+                "published_data_dir": "data",
+                "total_video_segments": int(media_written),
+            }
+        )
     text = json.dumps(manifest, indent=2, sort_keys=True)
     (target / "manifest.json").write_text(text, encoding="utf-8")
 

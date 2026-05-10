@@ -279,7 +279,9 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertFalse((target / "media.lance").exists())
 
             manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["format"], "rllab_lance_dataset_v1")
+            self.assertEqual(manifest["format"], "rllab_published_lance_dataset_v1")
+            self.assertEqual(manifest["published_layout"], "rllab_published_dataset_v1")
+            self.assertEqual(manifest["published_data_dir"], "data")
             self.assertEqual(manifest["dataset_id"], "rllab-postech/bg2-test")
             self.assertEqual(manifest["primary_training_table"], "data/episodes.lance")
             self.assertEqual(manifest["tables"]["episodes"], "data/episodes.lance")
@@ -288,6 +290,7 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(manifest["total_episodes"], 2)
             self.assertEqual(manifest["total_frames"], 6)
             self.assertEqual(manifest["total_videos"], 2)
+            self.assertEqual(manifest["total_video_segments"], 2)
 
             import lance
 
