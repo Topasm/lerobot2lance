@@ -279,6 +279,67 @@ dataset:
 
 `rllab_training.data.EpisodeDataset` reads the generated `manifest.json` and then uses `episodes.lance` as the primary training table — no further conversion step.
 
+## AI Worker / BG2 19D Pretraining Bundle
+
+After converting individual 19D LeRobot datasets into published Lance bundles
+under `data/converted_19d`, merge them into one training bundle:
+
+```bash
+PYTHONPATH=. ./.venv/bin/python scripts/build_pretrain_19d_lance.py \
+  --converted-root data/converted_19d \
+  --output data/pretrain_aiworker_19d \
+  --dataset-id rllab-postech/pretraining-aiworker-bg2-19d \
+  --overwrite
+```
+
+The merged bundle keeps the published layout:
+
+```text
+data/pretrain_aiworker_19d/
+  manifest.json
+  README.md
+  data/episodes.lance
+  data/train_episodes.lance
+  data/frames.lance
+  data/videos.lance
+  meta/sessions.json
+  meta/sources.json
+```
+
+`data/episodes.lance` is the published episode table with state/action arrays
+and no video blob columns. `data/train_episodes.lance` is the rllab-training
+table named by `manifest.json.primary_training_table`.
+
+By default this is a light numeric/text pretraining bundle. It does not
+duplicate MP4 bytes; `data/train_episodes.lance` has no `*_video_blob` columns
+and `data/videos.lance` is a source media index with `video_blob = null` plus
+`source_local_path`, `source_video_table`, `source_media_id`, and
+`source_relative_path`. Rows are re-indexed into a single episode/frame space
+and keep provenance columns such as `source_dataset`, `source_repo_id`,
+`source_dataset_url`, `source_episode_index`, `source_robot_type`, and
+`pretrain_tier`.
+
+Source repos whose names look like scratch/test uploads are excluded by default;
+pass `--include-review-names` to include them. To build only strict BG2
+full-body data, add `--strict-bg2-only`.
+
+Current `rllab-training` image policies require camera blobs in the selected
+training table, and `robo_dataview` plays merged videos from `data/videos.lance`.
+For a self-contained publish/training bundle, build the heavier variant:
+
+```bash
+PYTHONPATH=. ./.venv/bin/python scripts/build_pretrain_19d_lance.py \
+  --converted-root data/converted_19d \
+  --output data/pretrain_aiworker_19d_train \
+  --dataset-id rllab-postech/pretraining-aiworker-bg2-19d \
+  --copy-video-blobs \
+  --overwrite
+```
+
+`--copy-video-blobs` re-materializes MP4 bytes through Lance `take_blobs()`
+instead of copying the `{position, size}` blob handles returned by a normal
+Lance scan.
+
 ## Troubleshooting
 
 - **`FileNotFoundError: ... meta/info.json`** — `--source` doesn't look like a LeRobot dataset root. Check the directory contains `meta/info.json`, `data/`, and `videos/`.
