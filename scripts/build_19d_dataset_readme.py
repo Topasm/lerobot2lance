@@ -85,42 +85,97 @@ def load_converted_manifests(
     rows: list[dict[str, Any]] = []
     for manifest_path in sorted(converted_root.glob("*/manifest.json")):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        repo_id = manifest.get("source_repo_id") or manifest.get("source_dataset")
+        session = first_session(manifest_path.parent)
+        info = read_json_if_exists(manifest_path.parent / "meta" / "info.json")
+        repo_id = (
+            session.get("source_dataset")
+            or session.get("source_repo_id")
+            or info.get("repo_id")
+            or manifest.get("source_repo_id")
+            or manifest.get("source_dataset")
+            or manifest.get("dataset_id")
+        )
         status = status_by_repo.get(str(repo_id), {})
         index_row = index_rows.get(str(repo_id), {})
         report = status.get("report", {})
-        cameras = manifest.get("camera_keys") or report.get("cameras") or []
+        cameras = registry_cameras(manifest) or manifest.get("camera_keys") or report.get("cameras") or []
         counts = manifest.get("counts") or {}
-        frames = manifest.get("total_frames") or counts.get("frames") or report.get("frames_written")
-        episodes = manifest.get("total_episodes") or counts.get("episodes") or report.get("episodes_written")
+        frames = counts.get("frames") or manifest.get("total_frames") or report.get("frames_written")
+        episodes = counts.get("episodes") or manifest.get("total_episodes") or report.get("episodes_written")
         media = (
-            manifest.get("total_video_segments")
-            or manifest.get("total_videos")
-            or counts.get("videos")
+            counts.get("videos")
             or counts.get("media")
+            or manifest.get("total_video_segments")
+            or manifest.get("total_videos")
             or report.get("media_written")
         )
+        fps = (manifest.get("rates") or {}).get("fps") or manifest.get("fps") or report.get("fps") or index_row.get("fps")
         row = {
             "dataset_id": manifest.get("dataset_id") or manifest_path.parent.name,
             "local_path": str(manifest_path.parent),
             "source_repo_id": repo_id,
             "source_url": hf_dataset_url(repo_id),
             "status": "converted",
-            "robot_type": manifest.get("source_robot_type") or index_row.get("robot_type") or status.get("robot_type"),
-            "robot_name": manifest.get("source_robot_name") or index_row.get("robot_name"),
+            "robot_type": info.get("robot_type") or manifest.get("source_robot_type") or index_row.get("robot_type") or status.get("robot_type"),
+            "robot_name": info.get("robot_name") or manifest.get("source_robot_name") or index_row.get("robot_name"),
             "pretrain_tier": manifest.get("pretrain_tier"),
             "episodes": as_int(episodes),
             "frames": as_int(frames),
             "media": as_int(media),
-            "fps": manifest.get("fps") or report.get("fps") or index_row.get("fps"),
-            "action_dim": manifest.get("action_dim") or index_row.get("action_dim"),
-            "state_dim": manifest.get("state_dim") or index_row.get("state_dim"),
+            "fps": fps,
+            "action_dim": registry_dim(manifest, "actions", "action.body") or manifest.get("action_dim") or index_row.get("action_dim"),
+            "state_dim": registry_dim(manifest, "modalities", "state.body") or manifest.get("state_dim") or index_row.get("state_dim"),
             "cameras": cameras,
             "quality_flag": quality_flag(repo_id),
         }
         rows.append(row)
     rows.sort(key=lambda row: (str(row.get("source_repo_id")), str(row.get("dataset_id"))))
     return rows
+
+
+def read_json_if_exists(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def first_session(bundle: Path) -> dict[str, Any]:
+    path = bundle / "meta" / "sessions.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        return payload[0]
+    if isinstance(payload, dict):
+        sessions = payload.get("sessions")
+        if isinstance(sessions, list) and sessions and isinstance(sessions[0], dict):
+            return sessions[0]
+    return {}
+
+
+def registry_cameras(manifest: dict[str, Any]) -> list[str]:
+    cameras: list[str] = []
+    for entry in (manifest.get("modalities") or {}).values():
+        if isinstance(entry, dict) and entry.get("kind") == "video":
+            key = entry.get("camera_key") or entry.get("source_key")
+            if key:
+                cameras.append(str(key))
+    return sorted(cameras)
+
+
+def registry_dim(manifest: dict[str, Any], section: str, name: str) -> int | None:
+    entry = ((manifest.get(section) or {}).get(name) or {})
+    shape = entry.get("shape") or []
+    if isinstance(shape, list) and shape:
+        return as_int(shape[0])
+    return None
 
 
 def load_failed_rows(

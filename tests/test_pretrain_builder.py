@@ -6,6 +6,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from lerobot2lance.converter import _trajectory_sha256
+
 
 try:
     import lance
@@ -40,9 +42,33 @@ def _write_converted_19d_bundle(
             "observation_state": states,
             "actions": actions,
             "language_instruction": "pick",
-            f"{camera_column}_video_blob": b"abc",
-            f"{camera_column}_from_timestamp": 0.0,
-            f"{camera_column}_to_timestamp": 0.1,
+            "camera_segments": [
+                {
+                    "camera_key": camera_key,
+                    "camera_column": camera_column,
+                    "media_id": f"episode_00000000_{camera_column}",
+                    "from_timestamp": 0.0,
+                    "to_timestamp": 0.1,
+                    "frame_start": 0,
+                    "frame_count": 2,
+                }
+            ],
+            "task_segments": [
+                {
+                    "task_index": 0,
+                    "language_instruction": "pick",
+                    "start_frame": 0,
+                    "end_frame_exclusive": 2,
+                    "start_timestamp": 0.0,
+                    "end_timestamp_exclusive": 0.2,
+                }
+            ],
+            "trajectory_sha256": _trajectory_sha256([0.0, 0.1], states, actions),
+            "split": "train",
+            "source_dataset": repo_id,
+            "source_episode_index": 0,
+            "session_id": repo_id,
+            "embodiment_id": "ffw_bg2_rev4",
         }
     ]
     frame_rows = [
@@ -57,21 +83,36 @@ def _write_converted_19d_bundle(
             "state_norm": 1.0,
             "action_norm": 1.0,
             "is_bad_frame": False,
+            "split": "train",
+            "source_dataset": repo_id,
+            "session_id": repo_id,
+            "embodiment_id": "ffw_bg2_rev4",
         }
         for frame in range(2)
     ]
     video_rows = [
         {
-            "media_id": f"episode_000000_{camera_column}",
-            "episode_id": "episode_000000",
+            "media_id": f"episode_00000000_{camera_column}",
             "episode_index": 0,
             "camera_id": camera_column,
             "camera_name": camera_key,
-            "media_type": "video",
-            "uri": "videos/episode_000000.mp4",
+            "source": {
+                "uri": "videos/episode_000000.mp4",
+                "repo_id": repo_id,
+                "dataset_url": f"https://huggingface.co/datasets/{repo_id}",
+                "media_id": f"episode_00000000_{camera_column}",
+                "relative_path": "videos/episode_000000.mp4",
+            },
+            "source_uri": "videos/episode_000000.mp4",
+            "source_dataset": repo_id,
+            "source_dataset_url": f"https://huggingface.co/datasets/{repo_id}",
+            "source_media_id": f"episode_00000000_{camera_column}",
+            "source_relative_path": "videos/episode_000000.mp4",
+            "source_episode_index": 0,
+            "session_id": repo_id,
+            "embodiment_id": "ffw_bg2_rev4",
             "relative_path": "videos/episode_000000.mp4",
             "video_blob": b"abc",
-            "video_path": None,
             "from_timestamp": 0.0,
             "to_timestamp": 0.1,
             "num_frames": 2,
@@ -93,16 +134,46 @@ def _write_converted_19d_bundle(
             pa.field("fps", pa.float64()),
             pa.field("length", pa.int64()),
             pa.field("timestamps", pa.list_(pa.float64())),
-            pa.field("observation_state", pa.list_(pa.list_(pa.float32()))),
-            pa.field("actions", pa.list_(pa.list_(pa.float32()))),
+            pa.field("observation_state", pa.large_list(pa.list_(pa.float32(), 19))),
+            pa.field("actions", pa.large_list(pa.list_(pa.float32(), 19))),
             pa.field("language_instruction", pa.string()),
             pa.field(
-                f"{camera_column}_video_blob",
-                pa.large_binary(),
-                metadata={b"lance-encoding:blob": b"true"},
+                "camera_segments",
+                pa.list_(
+                    pa.struct(
+                        [
+                            pa.field("camera_key", pa.string()),
+                            pa.field("camera_column", pa.string()),
+                            pa.field("media_id", pa.string()),
+                            pa.field("from_timestamp", pa.float64()),
+                            pa.field("to_timestamp", pa.float64()),
+                            pa.field("frame_start", pa.int64()),
+                            pa.field("frame_count", pa.int64()),
+                        ]
+                    )
+                ),
             ),
-            pa.field(f"{camera_column}_from_timestamp", pa.float64()),
-            pa.field(f"{camera_column}_to_timestamp", pa.float64()),
+            pa.field(
+                "task_segments",
+                pa.list_(
+                    pa.struct(
+                        [
+                            pa.field("task_index", pa.int64()),
+                            pa.field("language_instruction", pa.string()),
+                            pa.field("start_frame", pa.int64()),
+                            pa.field("end_frame_exclusive", pa.int64()),
+                            pa.field("start_timestamp", pa.float64()),
+                            pa.field("end_timestamp_exclusive", pa.float64()),
+                        ]
+                    )
+                ),
+            ),
+            pa.field("trajectory_sha256", pa.string()),
+            pa.field("split", pa.string(), nullable=False),
+            pa.field("source_dataset", pa.string()),
+            pa.field("source_episode_index", pa.int64()),
+            pa.field("session_id", pa.string()),
+            pa.field("embodiment_id", pa.string()),
         ]
     )
     frame_schema = pa.schema(
@@ -112,29 +183,45 @@ def _write_converted_19d_bundle(
             pa.field("global_frame_index", pa.int64()),
             pa.field("timestamp", pa.float64()),
             pa.field("task_index", pa.int64()),
-            pa.field("observation_state", pa.list_(pa.float32())),
-            pa.field("action", pa.list_(pa.float32())),
+            pa.field("observation_state", pa.list_(pa.float32(), 19)),
+            pa.field("action", pa.list_(pa.float32(), 19)),
             pa.field("state_norm", pa.float32()),
             pa.field("action_norm", pa.float32()),
             pa.field("is_bad_frame", pa.bool_(), nullable=False),
+            pa.field("split", pa.string(), nullable=False),
+            pa.field("source_dataset", pa.string()),
+            pa.field("session_id", pa.string()),
+            pa.field("embodiment_id", pa.string()),
         ]
     )
     video_schema = pa.schema(
         [
             pa.field("media_id", pa.string()),
-            pa.field("episode_id", pa.string()),
             pa.field("episode_index", pa.int64()),
             pa.field("camera_id", pa.string()),
             pa.field("camera_name", pa.string()),
-            pa.field("media_type", pa.string()),
-            pa.field("uri", pa.string()),
-            pa.field("relative_path", pa.string()),
             pa.field(
-                "video_blob",
-                pa.large_binary(),
-                metadata={b"lance-encoding:blob": b"true"},
+                "source",
+                pa.struct(
+                    [
+                        pa.field("uri", pa.string()),
+                        pa.field("repo_id", pa.string()),
+                        pa.field("dataset_url", pa.string()),
+                        pa.field("media_id", pa.string()),
+                        pa.field("relative_path", pa.string()),
+                    ]
+                ),
             ),
-            pa.field("video_path", pa.string()),
+            pa.field("source_uri", pa.string()),
+            pa.field("source_dataset", pa.string()),
+            pa.field("source_dataset_url", pa.string()),
+            pa.field("source_media_id", pa.string()),
+            pa.field("source_relative_path", pa.string()),
+            pa.field("source_episode_index", pa.int64()),
+            pa.field("session_id", pa.string()),
+            pa.field("embodiment_id", pa.string()),
+            pa.field("relative_path", pa.string()),
+            lance.blob_field("video_blob"),
             pa.field("from_timestamp", pa.float64()),
             pa.field("to_timestamp", pa.float64()),
             pa.field("num_frames", pa.int64()),
@@ -152,36 +239,57 @@ def _write_converted_19d_bundle(
         pa.Table.from_pylist(episode_rows, schema=episode_schema),
         str(bundle / "data" / "episodes.lance"),
         mode="overwrite",
+        data_storage_version="2.2",
     )
     lance.write_dataset(
         pa.Table.from_pylist(frame_rows, schema=frame_schema),
         str(bundle / "data" / "frames.lance"),
         mode="overwrite",
+        data_storage_version="2.2",
     )
     lance.write_dataset(
-        pa.Table.from_pylist(video_rows, schema=video_schema),
+        _table_with_blob(pa, video_rows, video_schema, "video_blob"),
         str(bundle / "data" / "videos.lance"),
         mode="overwrite",
+        data_storage_version="2.2",
     )
 
     manifest = {
-        "format": "rllab_published_lance_dataset_v1",
+        "format": "rllab_published_lance_dataset_v2",
+        "schema_version": "2.0",
         "dataset_id": name,
         "source_repo_id": repo_id,
-        "source_dataset": repo_id,
         "source_robot_type": "ffw_bg2_rev4",
         "pretrain_tier": "A_bg2_full_19d",
-        "fps": 10.0,
-        "state_dim": 19,
-        "action_dim": 19,
-        "camera_keys": [camera_key],
-        "camera_columns": [camera_column],
-        "total_episodes": 1,
-        "total_frames": 2,
-        "total_videos": 1,
-        "total_video_segments": 1,
+        "modalities": {
+            "state.body": {"kind": "state", "shape": [19], "shape_policy": "single"},
+            f"video.{camera_column}": {
+                "kind": "video",
+                "camera_key": camera_key,
+                "camera_column": camera_column,
+            },
+        },
+        "actions": {"action.body": {"kind": "action", "shape": [19], "shape_policy": "single"}},
+        "rates": {"fps": 10.0},
+        "counts": {"episodes": 1, "frames": 2, "videos": 1},
+        "tables": {
+            "episodes": "data/episodes.lance",
+            "frames": "data/frames.lance",
+            "videos": "data/videos.lance",
+        },
     }
     (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _table_with_blob(pa: object, rows: list[dict], schema: object, blob_column: str):
+    arrays = []
+    for field in schema:
+        values = [row.get(field.name) for row in rows]
+        if field.name == blob_column:
+            arrays.append(lance.blob_array(values))
+        else:
+            arrays.append(pa.array(values, type=field.type))
+    return pa.Table.from_arrays(arrays, schema=schema)
 
 
 @unittest.skipUnless(HAS_LANCE_DEPS, "requires pyarrow + lance")
@@ -218,45 +326,53 @@ class PretrainBuilderTest(unittest.TestCase):
                         str(out),
                     ],
                     check=True,
+                    capture_output=True,
+                    text=True,
                     cwd=Path(__file__).resolve().parents[1],
                 )
 
                 manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-                self.assertEqual(manifest["media_mode"], "videos_table")
-                self.assertTrue(manifest["training_ready"])
+                self.assertEqual(manifest["format"], "rllab_published_lance_dataset_v2")
+                self.assertEqual(manifest["schema_version"], "2.0")
                 self.assertEqual(manifest["primary_training_table"], "data/train_episodes.lance")
-                self.assertEqual(manifest["frame_columns"]["state"], "observation_state")
-                self.assertEqual(manifest["frame_columns"]["action"], "action")
                 self.assertEqual(manifest["state_action_alignment"]["type"], "same_frame_timestamp")
                 self.assertIn("state.body", manifest["modalities"])
                 self.assertIn("action.body", manifest["actions"])
+                self.assertIn("video.cam_head", manifest["modalities"])
+                self.assertIn("video.cam_wrist_left", manifest["modalities"])
                 self.assertTrue(manifest["capabilities"]["camera_segments"])
-                self.assertEqual(manifest["blob_storage"]["episodes"], "absent")
-                self.assertEqual(manifest["blob_storage"]["train_episodes"], "absent")
-                self.assertEqual(manifest["blob_storage"]["videos"], "video_blob_column")
+                self.assertTrue(manifest["capabilities"]["modality_registry_v2"])
+                self.assertTrue(manifest["capabilities"]["fixed_size_state_action"])
+                self.assertTrue(manifest["capabilities"]["action_semantics"])
                 self.assertEqual(manifest["counts"]["episodes"], 2)
                 self.assertEqual(manifest["counts"]["frames"], 4)
                 self.assertEqual(manifest["counts"]["videos"], 2)
                 self.assertNotIn("media", manifest["counts"])
-                self.assertEqual(manifest["meta"]["stats"], "meta/stats.json")
                 self.assertEqual(manifest["meta"]["tasks_jsonl"], "meta/tasks.jsonl")
                 self.assertEqual(manifest["meta"]["episodes_jsonl"], "meta/episodes.jsonl")
                 self.assertEqual(manifest["meta"]["splits"], "meta/splits.json")
-                self.assertEqual(manifest["stats"]["source_table"], "data/train_episodes.lance")
-                self.assertEqual(
-                    manifest["camera_keys"],
-                    [
-                        "observation.images.cam_head",
-                        "observation.images.cam_wrist_left",
-                    ],
-                )
-                self.assertEqual(
-                    manifest["source_camera_keys"],
-                    [
-                        "observation.images.cam_head",
-                        "observation.images.cam_wrist_left",
-                    ],
-                )
+                self.assertNotIn("stats", manifest)
+                self.assertNotIn("tasks", manifest)
+                for forbidden in (
+                    "state_column",
+                    "action_column",
+                    "training_columns",
+                    "frame_columns",
+                    "state_dim",
+                    "action_dim",
+                    "camera_keys",
+                    "camera_columns",
+                    "camera_key_to_column",
+                    "fps",
+                    "media_mode",
+                    "camera_storage",
+                    "blob_storage",
+                    "total_episodes",
+                    "total_frames",
+                    "total_videos",
+                    "total_video_segments",
+                ):
+                    self.assertNotIn(forbidden, manifest)
 
                 episodes = lance.dataset(str(out / "data" / "episodes.lance"))
                 self.assertEqual(episodes.count_rows(), 2)
@@ -294,15 +410,17 @@ class PretrainBuilderTest(unittest.TestCase):
                 self.assertTrue(row["source_video_table"].endswith("/data/videos.lance"))
                 self.assertEqual(row["source_relative_path"], "videos/episode_000000.mp4")
 
-                stats = json.loads((out / "meta" / "stats.json").read_text())
-                self.assertEqual(stats["observation.state"]["count"], [4] * 19)
-                self.assertEqual(stats["action"]["count"], [4] * 19)
-                self.assertTrue((out / "meta" / "stats" / "state_body.json").exists())
+                state_stats = json.loads((out / "meta" / "stats" / "state_body.json").read_text())
+                action_stats = json.loads((out / "meta" / "stats" / "action_body.json").read_text())
+                self.assertEqual(state_stats["count"], [4] * 19)
+                self.assertEqual(action_stats["count"], [4] * 19)
+                self.assertFalse((out / "meta" / "stats.json").exists())
+                self.assertFalse((out / "meta" / "tasks.json").exists())
                 self.assertTrue((out / "meta" / "tasks.jsonl").exists())
                 self.assertTrue((out / "meta" / "episodes.jsonl").exists())
                 self.assertTrue((out / "meta" / "splits.json").exists())
-                tasks = json.loads((out / "meta" / "tasks.json").read_text())
-                self.assertEqual(tasks["tasks"][0]["language_instruction"], "pick")
+                task = json.loads((out / "meta" / "tasks.jsonl").read_text().splitlines()[0])
+                self.assertEqual(task["language_instruction"], "pick")
 
 
 def _read_blob(ds: object, column: str, index: int = 0) -> bytes:

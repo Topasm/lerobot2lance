@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,7 +42,13 @@ _FAKE_MP4 = (
 )
 
 
-def _write_v2_1_dataset(root: Path, *, episodes: int = 2, length: int = 4) -> None:
+def _write_v2_1_dataset(
+    root: Path,
+    *,
+    episodes: int = 2,
+    length: int = 4,
+    nonfinite_state: bool = False,
+) -> None:
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
     info = {
@@ -90,7 +98,11 @@ def _write_v2_1_dataset(root: Path, *, episodes: int = 2, length: int = 4) -> No
                 "episode_index": ep,
                 "index": ep * length + f,
                 "task_index": 0,
-                "observation.state": [float(ep), float(f), 0.0],
+                "observation.state": [
+                    float(ep),
+                    float(f),
+                    float("nan") if nonfinite_state and ep == 0 and f == 0 else 0.0,
+                ],
                 "action": [float(ep), float(f), 1.0],
             }
             for f in range(length)
@@ -146,11 +158,12 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertTrue((target / "manifest.json").exists())
             # Source info.json copied — downstream camera_info discovery relies on this.
             self.assertTrue((target / "meta" / "info.json").exists())
-            self.assertTrue((target / "meta" / "stats.json").exists())
             self.assertTrue((target / "meta" / "stats" / "state_body.json").exists())
             self.assertTrue((target / "meta" / "stats" / "action_body.json").exists())
-            self.assertTrue((target / "meta" / "tasks.json").exists())
             self.assertTrue((target / "meta" / "tasks.jsonl").exists())
+            # v2: no aggregate meta/stats.json or meta/tasks.json
+            self.assertFalse((target / "meta" / "stats.json").exists())
+            self.assertFalse((target / "meta" / "tasks.json").exists())
             self.assertTrue((target / "meta" / "episodes.jsonl").exists())
             self.assertTrue((target / "meta" / "splits.json").exists())
 
@@ -173,34 +186,62 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(row[0]["language_instruction"], "pick-and-place")
             self.assertEqual(row[0]["fps"], 30.0)
             self.assertEqual(row[0]["length"], 4)
-            self.assertEqual(row[0]["camera_segments"][0]["media_id"], "episode_000000_observation_images_cam_head")
-            self.assertEqual(row[0]["task_segments"][0]["task_index"], 0)
+            self.assertEqual(row[0]["camera_segments"][0]["media_id"], "episode_00000000_observation_images_cam_head")
+            seg0 = row[0]["task_segments"][0]
+            self.assertEqual(seg0["task_index"], 0)
+            self.assertEqual(seg0["start_frame"], 0)
+            self.assertEqual(seg0["end_frame_exclusive"], 4)
+            self.assertNotIn("end_frame", seg0)
             self.assertEqual(len(row[0]["trajectory_sha256"]), 64)
+            # trajectory_sha256 is binary-deterministic: same input must hash
+            # to the same value across runs.
+            from lerobot2lance.converter import _trajectory_sha256
+            full = ds.scanner(
+                columns=["timestamps", "observation_state", "actions"],
+                limit=1,
+            ).to_table().to_pylist()[0]
+            self.assertEqual(
+                row[0]["trajectory_sha256"],
+                _trajectory_sha256(
+                    full["timestamps"], full["observation_state"], full["actions"]
+                ),
+            )
 
             manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["format"], "rllab_lance_session_v1")
+            self.assertEqual(manifest["format"], "rllab_lance_session_v2")
+            self.assertEqual(manifest["schema_version"], "2.0")
+            self.assertEqual(manifest["lance"]["data_storage_version"], "2.2")
+            self.assertEqual(manifest["lance"]["blob_encoding"], "lance.blob.v2")
+            self.assertFalse(manifest["lance"]["external_blob_uris_allowed"])
             self.assertEqual(manifest["primary_training_table"], "episodes.lance")
-            self.assertEqual(manifest["media_mode"], "videos_table")
-            self.assertEqual(manifest["blob_storage"]["episodes"], "absent")
-            self.assertEqual(manifest["blob_storage"]["media"], "video_blob_column")
-            self.assertEqual(manifest["training_row_unit"], "episode")
-            self.assertEqual(manifest["training_index_column"], "episode_index")
-            self.assertIsNone(manifest["source_episode_column"])
-            self.assertIsNone(manifest["video_frame_offset_column"])
-            self.assertEqual(manifest["training_columns"]["state"], "observation_state")
-            self.assertEqual(manifest["training_columns"]["action"], "actions")
-            self.assertEqual(manifest["frame_columns"]["state"], "observation_state")
-            self.assertEqual(manifest["frame_columns"]["action"], "action")
             self.assertEqual(manifest["state_action_alignment"]["type"], "same_frame_timestamp")
-            self.assertEqual(manifest["camera_keys"], ["observation.images.cam_head"])
-            self.assertEqual(manifest["camera_columns"], ["observation_images_cam_head"])
-            self.assertEqual(
-                manifest["camera_key_to_column"],
-                {"observation.images.cam_head": "observation_images_cam_head"},
-            )
+            for forbidden in (
+                "state_column",
+                "action_column",
+                "training_columns",
+                "frame_columns",
+                "state_dim",
+                "action_dim",
+                "camera_keys",
+                "camera_columns",
+                "camera_key_to_column",
+                "fps",
+                "media_mode",
+                "camera_storage",
+                "blob_storage",
+                "total_episodes",
+                "total_frames",
+                "total_videos",
+                "total_video_segments",
+            ):
+                self.assertNotIn(forbidden, manifest, f"flat alias leaked: {forbidden}")
             self.assertIn("state.body", manifest["modalities"])
             self.assertIn("video.cam_head", manifest["modalities"])
             self.assertIn("action.body", manifest["actions"])
+            self.assertEqual(manifest["modalities"]["state.body"]["shape_policy"], "single")
+            self.assertEqual(manifest["modalities"]["video.cam_head"]["encoding"], "rgb8_h264")
+            self.assertEqual(manifest["actions"]["action.body"]["shape_policy"], "single")
+            self.assertTrue(manifest["capabilities"]["lance_blob_v2"])
             self.assertTrue(manifest["capabilities"]["camera_segments"])
             self.assertEqual(manifest["meta"]["tasks_jsonl"], "meta/tasks.jsonl")
             self.assertEqual(manifest["meta"]["state_body_stats"], "meta/stats/state_body.json")
@@ -208,8 +249,9 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(manifest["counts"]["frames"], 8)
             self.assertEqual(manifest["counts"]["videos"], 2)
             self.assertNotIn("media", manifest["counts"])
-            self.assertEqual(manifest["state_dim"], 3)
-            self.assertEqual(manifest["action_dim"], 3)
+            self.assertEqual(manifest["tables"]["media"], "media.lance")
+            self.assertEqual(manifest["modalities"]["state.body"]["shape"], [3])
+            self.assertEqual(manifest["actions"]["action.body"]["shape"], [3])
             self.assertNotIn(
                 "observation_images_cam_head_video_blob",
                 ds.schema.names,
@@ -232,12 +274,10 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             media_row = media.scanner(
                 columns=[
                     "camera_name",
-                    "media_type",
                     "source",
                     "source_uri",
                     "source_relative_path",
                     "relative_path",
-                    "video_path",
                     "from_timestamp",
                     "to_timestamp",
                     "num_frames",
@@ -247,25 +287,29 @@ class LerobotToLanceConversionTest(unittest.TestCase):
                 limit=1,
             ).to_table().to_pylist()[0]
             self.assertEqual(media_row["camera_name"], "observation.images.cam_head")
-            self.assertEqual(media_row["media_type"], "video")
+            self.assertNotIn("media_type", media_row)
+            self.assertNotIn("episode_id", media_row)
             self.assertTrue(media_row["source"]["uri"].endswith("episode_000000.mp4"))
             self.assertTrue(media_row["source_uri"].endswith("episode_000000.mp4"))
             self.assertEqual(
                 media_row["source_relative_path"],
                 "videos/chunk-000/observation.images.cam_head/episode_000000.mp4",
             )
-            self.assertIsNone(media_row["video_path"])
+            self.assertNotIn("video_path", media_row)
+            self.assertNotIn("uri", media_row)
             self.assertEqual(media_row["from_timestamp"], 0.0)
             self.assertAlmostEqual(media_row["to_timestamp"], 0.1)
             self.assertEqual(media_row["num_frames"], 4)
             self.assertEqual(media_row["width_pixels"], 320)
             self.assertEqual(media_row["height_pixels"], 240)
 
-            stats = json.loads((target / "meta" / "stats.json").read_text())
-            self.assertEqual(stats["observation.state"]["count"], [8, 8, 8])
-            self.assertEqual(stats["action"]["count"], [8, 8, 8])
-            tasks = json.loads((target / "meta" / "tasks.json").read_text())
-            self.assertEqual(tasks["tasks"][0]["language_instruction"], "pick-and-place")
+            state_stats = json.loads(
+                (target / "meta" / "stats" / "state_body.json").read_text()
+            )
+            self.assertEqual(state_stats["count"], [8, 8, 8])
+            tasks_jsonl = (target / "meta" / "tasks.jsonl").read_text().splitlines()
+            tasks = [json.loads(line) for line in tasks_jsonl if line.strip()]
+            self.assertEqual(tasks[0]["language_instruction"], "pick-and-place")
             splits = json.loads((target / "meta" / "splits.json").read_text())
             self.assertEqual(splits["splits"]["train"], [0, 1])
 
@@ -314,6 +358,214 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             )
             self.assertTrue(media_row["video_blob"])
 
+    def test_hf_layout_video_blob_invariants(self) -> None:
+        """C3/C5 invariants on videos.lance: media_id uniqueness,
+        camera_segments resolution, sha256 round-trip, byte_size consistency.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "lerobot"
+            target = Path(tmpdir) / "published"
+            _write_v2_1_dataset(source, episodes=2, length=3)
+
+            convert_lerobot_to_lance(
+                source,
+                target,
+                output_layout="hf",
+                dataset_id="rllab-postech/bg2-test",
+            )
+
+            import hashlib
+
+            import lance
+
+            videos = lance.dataset(str(target / "data" / "videos.lance"))
+            rows = videos.scanner(
+                columns=["media_id", "sha256", "byte_size"]
+            ).to_table().to_pylist()
+
+            # C3: media_id uniqueness within videos.lance
+            media_ids = [r["media_id"] for r in rows]
+            self.assertEqual(
+                len(media_ids), len(set(media_ids)), "media_id duplicated"
+            )
+
+            # C5: video_blob round-trips through sha256 / byte_size
+            blob_files = videos.take_blobs(
+                "video_blob", indices=list(range(len(rows)))
+            )
+            try:
+                for idx, row in enumerate(rows):
+                    blob_bytes = blob_files[idx].read()
+                    self.assertEqual(
+                        row["byte_size"],
+                        len(blob_bytes),
+                        f"byte_size mismatch for {row['media_id']}",
+                    )
+                    self.assertEqual(
+                        row["sha256"],
+                        hashlib.sha256(blob_bytes).hexdigest(),
+                        f"sha256 mismatch for {row['media_id']}",
+                    )
+            finally:
+                for bf in blob_files:
+                    bf.close()
+
+            # C3: every camera_segments[*].media_id resolves to a videos row
+            episodes = lance.dataset(str(target / "data" / "episodes.lance"))
+            ep_rows = episodes.scanner(
+                columns=["camera_segments"]
+            ).to_table().to_pylist()
+            referenced = {
+                seg["media_id"]
+                for ep in ep_rows
+                for seg in ep["camera_segments"]
+            }
+            self.assertTrue(referenced)
+            missing = referenced - set(media_ids)
+            self.assertFalse(
+                missing,
+                f"camera_segments reference unknown media_id: {missing}",
+            )
+
+    def test_hf_layout_a8_denormalized_columns(self) -> None:
+        """A8: episodes/frames/videos carry split, source_dataset,
+        session_id, embodiment_id; values align across tables.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "lerobot"
+            target = Path(tmpdir) / "published"
+            _write_v2_1_dataset(source, episodes=2, length=3)
+
+            convert_lerobot_to_lance(
+                source,
+                target,
+                output_layout="hf",
+                dataset_id="rllab-postech/bg2-test",
+                embodiment_id="bg2_dual_arm_v1",
+            )
+
+            import lance
+
+            episodes = lance.dataset(str(target / "data" / "episodes.lance"))
+            frames = lance.dataset(str(target / "data" / "frames.lance"))
+            videos = lance.dataset(str(target / "data" / "videos.lance"))
+
+            for ds, table in (
+                (episodes, "episodes"),
+                (frames, "frames"),
+                (videos, "videos"),
+            ):
+                names = ds.schema.names
+                self.assertIn("source_dataset", names, table)
+                self.assertIn("session_id", names, table)
+                self.assertIn("embodiment_id", names, table)
+            self.assertIn("split", episodes.schema.names)
+            self.assertIn("source_episode_index", episodes.schema.names)
+            self.assertIn("split", frames.schema.names)
+
+            ep_rows = episodes.scanner(
+                columns=[
+                    "episode_index",
+                    "split",
+                    "source_dataset",
+                    "source_episode_index",
+                    "session_id",
+                    "embodiment_id",
+                ]
+            ).to_table().to_pylist()
+            for row in ep_rows:
+                self.assertEqual(row["split"], "train")
+                self.assertEqual(row["embodiment_id"], "bg2_dual_arm_v1")
+                self.assertEqual(row["source_episode_index"], row["episode_index"])
+                self.assertIsNotNone(row["session_id"])
+
+            def _index_types(ds) -> dict[str, str]:
+                return {idx["name"]: idx["type"] for idx in ds.list_indices()}
+
+            for ds, label in (
+                (episodes, "episodes"),
+                (frames, "frames"),
+                (videos, "videos"),
+            ):
+                types = _index_types(ds)
+                for col in ("source_dataset_idx", "session_id_idx", "embodiment_id_idx"):
+                    self.assertEqual(types.get(col), "Bitmap", f"{label}.{col}")
+            for ds, label in ((episodes, "episodes"), (frames, "frames")):
+                self.assertEqual(
+                    _index_types(ds).get("split_idx"), "Bitmap", f"{label}.split"
+                )
+
+    def test_hf_layout_episode_frame_alignment(self) -> None:
+        """C4 invariants: counts.frames matches sum of episode lengths,
+        and frames.lance rows align with episodes.lance per-frame arrays.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "lerobot"
+            target = Path(tmpdir) / "published"
+            _write_v2_1_dataset(source, episodes=2, length=3)
+
+            convert_lerobot_to_lance(
+                source,
+                target,
+                output_layout="hf",
+                dataset_id="rllab-postech/bg2-test",
+            )
+
+            import lance
+
+            manifest = json.loads(
+                (target / "manifest.json").read_text(encoding="utf-8")
+            )
+            episodes = lance.dataset(str(target / "data" / "episodes.lance"))
+            frames = lance.dataset(str(target / "data" / "frames.lance"))
+
+            ep_rows = episodes.scanner(
+                columns=[
+                    "episode_index",
+                    "length",
+                    "timestamps",
+                    "observation_state",
+                    "actions",
+                ]
+            ).to_table().to_pylist()
+            ep_rows.sort(key=lambda r: r["episode_index"])
+
+            # C4: counts.frames == sum(episodes.length)
+            self.assertEqual(
+                manifest["counts"]["frames"],
+                sum(r["length"] for r in ep_rows),
+            )
+            self.assertEqual(
+                manifest["counts"]["frames"],
+                frames.count_rows(),
+            )
+
+            frame_rows = frames.scanner(
+                columns=[
+                    "episode_index",
+                    "frame_index",
+                    "timestamp",
+                    "observation_state",
+                    "action",
+                ]
+            ).to_table().to_pylist()
+
+            # C4: each frame row matches the per-episode arrays at frame_index
+            ep_by_index = {r["episode_index"]: r for r in ep_rows}
+            for frame in frame_rows:
+                ep = ep_by_index[frame["episode_index"]]
+                fi = frame["frame_index"]
+                self.assertAlmostEqual(
+                    frame["timestamp"], ep["timestamps"][fi], places=6
+                )
+                self.assertEqual(
+                    list(frame["observation_state"]),
+                    list(ep["observation_state"][fi]),
+                )
+                self.assertEqual(
+                    list(frame["action"]), list(ep["actions"][fi])
+                )
+
     def test_hf_layout_writes_data_tables_and_card(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "lerobot"
@@ -333,42 +585,64 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertTrue((target / "README.md").exists())
             self.assertTrue((target / "meta" / "info.json").exists())
             self.assertTrue((target / "meta" / "sessions.json").exists())
-            self.assertTrue((target / "meta" / "stats.json").exists())
             self.assertTrue((target / "meta" / "stats" / "state_body.json").exists())
-            self.assertTrue((target / "meta" / "tasks.json").exists())
+            self.assertTrue((target / "meta" / "stats" / "action_body.json").exists())
             self.assertTrue((target / "meta" / "tasks.jsonl").exists())
             self.assertTrue((target / "meta" / "episodes.jsonl").exists())
             self.assertTrue((target / "meta" / "splits.json").exists())
+            # v2: no aggregate compatibility sidecars
+            self.assertFalse((target / "meta" / "stats.json").exists())
+            self.assertFalse((target / "meta" / "tasks.json").exists())
             for name in ("episodes.lance", "frames.lance", "videos.lance"):
                 self.assertTrue((target / "data" / name).exists(), f"{name} missing")
             self.assertFalse((target / "media.lance").exists())
 
             manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["format"], "rllab_published_lance_dataset_v1")
-            self.assertEqual(manifest["published_layout"], "rllab_published_dataset_v1")
-            self.assertEqual(manifest["published_data_dir"], "data")
+            self.assertEqual(manifest["format"], "rllab_published_lance_dataset_v2")
+            self.assertEqual(manifest["schema_version"], "2.0")
             self.assertEqual(manifest["dataset_id"], "rllab-postech/bg2-test")
             self.assertEqual(manifest["primary_training_table"], "data/episodes.lance")
-            self.assertEqual(manifest["media_mode"], "videos_table")
-            self.assertEqual(manifest["camera_storage"], "videos_table")
-            self.assertEqual(manifest["blob_storage"]["episodes"], "absent")
-            self.assertEqual(manifest["blob_storage"]["videos"], "video_blob_column")
             self.assertEqual(manifest["tables"]["episodes"], "data/episodes.lance")
             self.assertEqual(manifest["tables"]["frames"], "data/frames.lance")
             self.assertEqual(manifest["tables"]["videos"], "data/videos.lance")
             self.assertEqual(manifest["counts"]["episodes"], 2)
             self.assertEqual(manifest["counts"]["frames"], 6)
             self.assertEqual(manifest["counts"]["videos"], 2)
-            self.assertEqual(manifest["meta"]["stats"], "meta/stats.json")
-            self.assertEqual(manifest["meta"]["splits"], "meta/splits.json")
             self.assertEqual(manifest["modalities"]["state.body"]["column"], "observation_state")
             self.assertEqual(manifest["actions"]["action.body"]["column"], "actions")
-            self.assertEqual(manifest["stats"]["source_table"], "data/episodes.lance")
-            self.assertEqual(manifest["tasks"]["path"], "meta/tasks.json")
-            self.assertEqual(manifest["total_episodes"], 2)
-            self.assertEqual(manifest["total_frames"], 6)
-            self.assertEqual(manifest["total_videos"], 2)
-            self.assertEqual(manifest["total_video_segments"], 2)
+            semantics = manifest["actions"]["action.body"]["semantics"]
+            for key in (
+                "command_type",
+                "absolute_or_delta",
+                "units",
+                "control_frame",
+                "applies_to_interval",
+                "normalized",
+            ):
+                self.assertIn(key, semantics)
+            # v2: flat aliases and aggregate sidecar paths must be absent
+            for forbidden in (
+                "state_column",
+                "action_column",
+                "training_columns",
+                "frame_columns",
+                "state_dim",
+                "action_dim",
+                "camera_keys",
+                "camera_columns",
+                "camera_key_to_column",
+                "fps",
+                "media_mode",
+                "camera_storage",
+                "blob_storage",
+                "total_episodes",
+                "total_frames",
+                "total_videos",
+                "total_video_segments",
+            ):
+                self.assertNotIn(forbidden, manifest, f"flat alias leaked: {forbidden}")
+            self.assertNotIn("stats", manifest.get("meta", {}))
+            self.assertNotIn("tasks", manifest.get("meta", {}))
 
             import lance
 
@@ -383,22 +657,52 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             sessions = json.loads((target / "meta" / "sessions.json").read_text())
             self.assertEqual(sessions[0]["episodes"], 2)
 
+            import pyarrow as pa
+
+            frames_ds = lance.dataset(str(target / "data" / "frames.lance"))
             blob_field = videos.schema.field("video_blob")
             self.assertEqual(
-                blob_field.metadata.get(b"lance-encoding:blob"), b"true"
+                getattr(blob_field.type, "extension_name", None), "lance.blob.v2"
+            )
+            self.assertEqual(
+                frames_ds.schema.field("observation_state").type,
+                pa.list_(pa.float32(), 3),
+            )
+            self.assertEqual(
+                episodes.schema.field("observation_state").type,
+                pa.large_list(pa.list_(pa.float32(), 3)),
             )
 
-            video_indices = {idx["name"] for idx in videos.list_indices()}
-            self.assertIn("episode_index_idx", video_indices)
-            self.assertIn("camera_id_idx", video_indices)
-            self.assertIn("media_id_idx", video_indices)
-            episode_indices = {idx["name"] for idx in episodes.list_indices()}
-            self.assertIn("episode_index_idx", episode_indices)
+            def _index_types(ds) -> dict[str, str]:
+                return {idx["name"]: idx["type"] for idx in ds.list_indices()}
+
+            video_idx_types = _index_types(videos)
+            self.assertEqual(video_idx_types.get("media_id_idx"), "BTree")
+            self.assertEqual(video_idx_types.get("episode_index_idx"), "BTree")
+            self.assertEqual(video_idx_types.get("camera_id_idx"), "Bitmap")
+
+            episode_idx_types = _index_types(episodes)
+            self.assertEqual(episode_idx_types.get("episode_index_idx"), "BTree")
+            self.assertEqual(episode_idx_types.get("task_index_idx"), "Bitmap")
+
+            frame_idx_types = _index_types(frames_ds)
+            self.assertEqual(frame_idx_types.get("global_frame_index_idx"), "BTree")
+            self.assertEqual(frame_idx_types.get("episode_index_idx"), "BTree")
+            self.assertEqual(frame_idx_types.get("frame_index_idx"), "BTree")
+            self.assertEqual(frame_idx_types.get("task_index_idx"), "Bitmap")
+            self.assertEqual(frame_idx_types.get("is_bad_frame_idx"), "Bitmap")
 
             created = manifest["indexes"]["created"]
             tables_indexed = {entry["table"] for entry in created}
             self.assertIn("data/videos.lance", tables_indexed)
             self.assertIn("data/episodes.lance", tables_indexed)
+            # Manifest must record both BTREE and BITMAP entries for frames.
+            frame_index_types = {
+                entry["index_type"]
+                for entry in created
+                if entry["table"] == "data/frames.lance"
+            }
+            self.assertEqual(frame_index_types, {"BTREE", "BITMAP"})
             self.assertEqual(
                 manifest["reader_hints"]["lazy_blob_columns"],
                 {"data/videos.lance": ["video_blob"]},
@@ -408,6 +712,33 @@ class LerobotToLanceConversionTest(unittest.TestCase):
                 frag_strategy["data/videos.lance"]["max_bytes_per_file"],
                 2 * 1024 * 1024 * 1024,
             )
+            validation = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/validate_bundle.py",
+                    str(target),
+                    "--json",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertTrue(json.loads(validation.stdout)["ok"])
+
+    def test_rejects_nonfinite_trajectory_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "lerobot"
+            target = Path(tmpdir) / "published"
+            _write_v2_1_dataset(source, episodes=1, length=2, nonfinite_state=True)
+
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                convert_lerobot_to_lance(
+                    source,
+                    target,
+                    output_layout="hf",
+                    dataset_id="rllab-postech/bad-nan",
+                )
 
 
 class ErrorPathTest(unittest.TestCase):

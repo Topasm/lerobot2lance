@@ -107,11 +107,12 @@ def target_is_done(target_dir: Path) -> bool:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return False
-    blob_storage = payload.get("blob_storage") or {}
     return (
-        payload.get("media_mode") == "videos_table"
-        and blob_storage.get("episodes") == "absent"
-        and blob_storage.get("videos") == "video_blob_column"
+        payload.get("format") == "rllab_published_lance_dataset_v2"
+        and str(payload.get("schema_version")) == "2.0"
+        and (payload.get("lance") or {}).get("blob_encoding") == "lance.blob.v2"
+        and (payload.get("tables") or {}).get("episodes") == "data/episodes.lance"
+        and (payload.get("tables") or {}).get("videos") == "data/videos.lance"
     )
 
 

@@ -11,6 +11,8 @@ Output is identical for both, so downstream code only ever has to deal with one 
 
 The published bundle format is fixed by [`docs/STANDARD.md`](docs/STANDARD.md) —
 that document is the contract; the README below is a usage walkthrough.
+Implementation progress for v2.0 is tracked in
+[`docs/V2_IMPLEMENTATION_CHECKLIST.md`](docs/V2_IMPLEMENTATION_CHECKLIST.md).
 
 ## Install
 
