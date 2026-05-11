@@ -35,7 +35,8 @@ bundles, fetches videos via
 surfaces `manifest.actions.action.body.semantics` through
 `DatasetSummary.action_semantics`; the episode viewer renders a single-line
 semantics badge under the action plot. The `rllab-data-collection` publish
-path emits v2-clean published bundles from raw session data. A fresh ubless
+path emits v2-clean published bundles directly from raw MCAP sessions without
+requiring an intermediate session Lance. A fresh ubless
 BG2 v2 probe validates, loads in `rllab-training`, completes a 2-step
 optimizer smoke run, and reloads through `rllab-infer` with a 19-D action
 prediction. The only cross-repo follow-on left is the optional
@@ -58,7 +59,7 @@ Legend:
 | Section | Scope | Done | Partial | Open | Deferred |
 | --- | --- | --- | --- | --- | --- |
 | A | `lerobot2lance` v2 contract | 12 | 0 | 0 | 0 |
-| B | Cross-repo consumers (`rllab-training`, `robo_dataview`, `rllab-data-collection`) | 20 | 1 | 0 | 0 |
+| B | Cross-repo consumers (`rllab-training`, `robo_dataview`, `rllab-data-collection`) | 21 | 1 | 0 | 0 |
 | C | Conformance / validator suite | 7 | 0 | 0 | 0 |
 | D | Operational data tasks (smoke tests, publish) | 4 | 0 | 4 | 0 |
 | E | Open questions | 0 | 0 | 1 | 0 |
@@ -225,11 +226,21 @@ silently break the viewer.)
   `meta/tasks.jsonl`, `meta/episodes.jsonl`, `meta/splits.json`,
   `meta/sessions.json`, and `meta/stats/{name}.json`. Root
   `meta/tasks.json` / `meta/stats.json` are not emitted.
+* [x] **B3.8.** Raw-only collection can publish directly to v2 without a
+  prepared/intermediate Lance session. `tools/publish_raw_dataset.py` replays
+  `raw_rosbags/episode_*` MCAP bags, latest-joins camera/state/action streams
+  on the published FPS grid, encodes sampled JPEG camera frames to MP4, and
+  writes `data/{episodes,frames,videos}.lance` plus the v2 manifest/sidecars.
+  The stack wrapper is `scripts/publish_raw_dataset.sh`; the old
+  `publish_lance_dataset.sh` remains legacy compatibility for prepared Lance
+  sessions only.
 
   Verification: `tests/test_publish_dataset.py` passes under the
   `rllab-training` venv (`3 passed`), and a synthetic published bundle produced
   by `tools/publish_dataset.py` passes
-  `lerobot2lance/scripts/validate_bundle.py`.
+  `lerobot2lance/scripts/validate_bundle.py`. The raw direct publisher has
+  focused coverage in `tests/test_publish_raw_dataset.py` for raw session
+  discovery, latest-join sampling, and no-intermediate Lance output.
 
 ---
 
