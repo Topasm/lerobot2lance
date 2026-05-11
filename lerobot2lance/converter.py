@@ -407,6 +407,7 @@ def convert_lerobot_to_lance(
         output_layout=output_layout,
         dataset_id=dataset_id,
         source_repo_id=source_repo_id,
+        info=info,
         indexes_built=indexes_built,
     )
     if output_layout == "hf":
@@ -1237,7 +1238,62 @@ def _build_modalities(
     return modalities
 
 
-def _build_actions(*, action_dim: int, fps: float, episodes_path: str, frames_path: str) -> dict[str, Any]:
+def _default_unknown_action_semantics() -> dict[str, Any]:
+    return {
+        "command_type": "unknown",
+        "absolute_or_delta": "unknown",
+        "units": "unknown",
+        "control_frame": "unknown",
+        "applies_to_interval": "[t_i, t_{i+1})",
+        "normalized": False,
+    }
+
+
+def _infer_action_semantics(
+    info: dict[str, Any],
+    *,
+    source_repo_id: str | None,
+    action_dim: int,
+) -> dict[str, Any]:
+    """Best-effort semantics for known ROBOTIS/FFW LeRobot datasets.
+
+    LeRobot's feature schema tells us shape/names, but not whether the command
+    is position, velocity, delta pose, or normalized. Keep unknown as the
+    default and only fill concrete semantics for datasets whose robot family
+    and dimensionality match the FFW joint-position recordings we use for BG2.
+    """
+
+    robot_type = str(info.get("robot_type") or "").lower()
+    robot_name = str(info.get("robot_name") or "").lower()
+    repo = str(source_repo_id or "").lower()
+    ffw_family = (
+        robot_type.startswith("ffw_")
+        or robot_name.startswith("ffw_")
+        or "ffw_bg2" in repo
+        or "ffw_sg2" in repo
+        or "ffw_arm_only" in repo
+        or repo.startswith(("robotis/", "robotissw/", "dongkkka/"))
+    )
+    if ffw_family and int(action_dim) in {16, 19, 25}:
+        return {
+            "command_type": "joint_position",
+            "absolute_or_delta": "absolute",
+            "units": "mixed",
+            "control_frame": "robot_base",
+            "applies_to_interval": "[t_i, t_{i+1})",
+            "normalized": False,
+        }
+    return _default_unknown_action_semantics()
+
+
+def _build_actions(
+    *,
+    action_dim: int,
+    fps: float,
+    episodes_path: str,
+    frames_path: str,
+    action_semantics: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "action.body": {
             "kind": "action",
@@ -1254,18 +1310,7 @@ def _build_actions(*, action_dim: int, fps: float, episodes_path: str, frames_pa
             "rate_hz": float(fps),
             "stats": "meta/stats/action_body.json",
             "alignment": "same_frame_timestamp",
-            # Action semantics with conservative defaults. Source-specific
-            # converters (e.g. for richer LeRobot info.json or RLLAB-collected
-            # bundles) should override these via the standard. Readers must
-            # treat any field as nullable/unknown.
-            "semantics": {
-                "command_type": "unknown",          # joint_position | joint_velocity | ee_pose | ee_delta | gripper | mixed | unknown
-                "absolute_or_delta": "unknown",     # absolute | delta | unknown
-                "units": "unknown",                 # rad | m | normalized | mixed | unknown
-                "control_frame": "unknown",         # robot_base | end_effector | world | unknown
-                "applies_to_interval": "[t_i, t_{i+1})",
-                "normalized": False,
-            },
+            "semantics": dict(action_semantics),
         }
     }
 
@@ -1328,6 +1373,7 @@ def _write_manifest(
     output_layout: str,
     dataset_id: str | None,
     source_repo_id: str | None,
+    info: dict[str, Any],
     indexes_built: dict[str, list[dict[str, str]] | list[str]] | None = None,
 ) -> None:
     is_hf = output_layout == "hf"
@@ -1342,6 +1388,12 @@ def _write_manifest(
         tables["frames"] = frames_path
     if has_media:
         tables["videos" if is_hf else "media"] = media_path
+
+    action_semantics = _infer_action_semantics(
+        info,
+        source_repo_id=source_repo_id,
+        action_dim=action_dim,
+    )
 
     manifest = {
         "format": RLLAB_PUBLISHED_FORMAT if is_hf else RLLAB_SESSION_FORMAT,
@@ -1385,7 +1437,9 @@ def _write_manifest(
             fps=fps,
             episodes_path=episodes_path,
             frames_path=frames_path,
+            action_semantics=action_semantics,
         ),
+        "training_targets": ["action.body"],
         "rates": {
             "fps": float(fps),
             "modalities": {

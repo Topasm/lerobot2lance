@@ -92,6 +92,7 @@ for non-LeRobot sources that cannot provide `meta/info.json.features.*.names`.
 | `tables` | object | logical table name -> relative path or table descriptor |
 | `modalities` | object | canonical observation/input registry; see §7 |
 | `actions` | object | canonical action/target registry; see §7 |
+| `training_targets` | list[string] | optional ordered action registry keys that a default training reader should predict |
 | `rates` | object | primary and per-modality/action rates |
 | `state_action_alignment` | object | timestamp/index alignment contract; see §6 |
 | `indexes` | object | `created` and `recommended` indexes |
@@ -425,6 +426,14 @@ perform the shift themselves.
 hand, tactile, depth, and future datasets add entries without changing the
 core table contract. For the BG2 baseline the registry contains `state.body`,
 `action.body`, and one `video.<camera>` entry per camera.
+
+`state.body` and `action.body` are conventional names for the BG2/body-vector
+baseline, not universal requirements. Datasets may publish action entries such
+as `action.arm`, `action.ee_delta`, `action.gripper`, or task-specific targets
+when those names better describe the command. Consumers MUST select the action
+target from their configuration or `manifest.training_targets` when present;
+they MUST NOT hard-code `action.body` unless they intentionally only support
+BG2 body-vector bundles.
 
 Valid `kind` values:
 

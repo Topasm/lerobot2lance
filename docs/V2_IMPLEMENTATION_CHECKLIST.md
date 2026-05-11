@@ -18,18 +18,29 @@ deeper plan in [`checklist.md`](checklist.md).
 A fresh LeRobot dataset can be converted with
 `lerobot2lance --layout hf --target <out>` and verified with
 `scripts/validate_bundle.py <out>`; both produce a v2-clean bundle that
-passes every conformance test in this repo (19 / 19, last run on 2026-05-11).
+passes every conformance test in this repo (20 / 20, last run on 2026-05-11).
 
 Legacy-bundle migration and the pretrain merge re-run that depended on it
 are out of scope — the lab is creating fresh v2 bundles from current
 source LeRobot data, not migrating old `data/converted_19d/*` artifacts.
 
-Cross-repo status: `rllab-training` now reads v2 bundles without v1 aliases,
-and the `robo_dataview` backend can open the ubless v2 probe bundle, list
-episodes, read state/action timeseries, and fetch videos by
-`camera_segments[*].media_id -> videos.media_id -> take_blobs`. Remaining
-cross-repo work is action-semantics enforcement, task-segment UI display,
-publisher adoption, and publish/remote smoke tasks.
+Cross-repo status: `rllab-training` reads v2 bundles without v1 aliases,
+exposes `task_segments` with the canonical
+`[start_frame, end_frame_exclusive)` shape, refuses to train on unknown
+action semantics, and ships a `verify_trajectory_sha256` recompute path
+(plus a `DatasetConfig.verify_trajectory_hashes` opt-in to run it on every
+episode at construction time). The `robo_dataview` backend opens v2
+bundles, fetches videos via
+`camera_segments[*].media_id -> videos.media_id -> take_blobs`, and now
+surfaces `manifest.actions.action.body.semantics` through
+`DatasetSummary.action_semantics`; the episode viewer renders a single-line
+semantics badge under the action plot. The `rllab-data-collection` publish
+path emits v2-clean published bundles from raw session data. A fresh ubless
+BG2 v2 probe validates, loads in `rllab-training`, completes a 2-step
+optimizer smoke run, and reloads through `rllab-infer` with a 19-D action
+prediction. The only cross-repo follow-on left is the optional
+`media_id + sha256` decoder cache key (B2.4) and the HF publish / remote-read
+smoke tasks in §D.
 
 Legend:
 
@@ -46,10 +57,10 @@ Legend:
 
 | Section | Scope | Done | Partial | Open | Deferred |
 | --- | --- | --- | --- | --- | --- |
-| A | `lerobot2lance` v2 contract | 11 | 0 | 1 | 0 |
-| B | Cross-repo consumers (`rllab-training`, `robo_dataview`, `rllab-data-collection`) | 8 | 1 | 12 | 0 |
+| A | `lerobot2lance` v2 contract | 12 | 0 | 0 | 0 |
+| B | Cross-repo consumers (`rllab-training`, `robo_dataview`, `rllab-data-collection`) | 20 | 1 | 0 | 0 |
 | C | Conformance / validator suite | 7 | 0 | 0 | 0 |
-| D | Operational data tasks (smoke tests, publish) | 1 | 1 | 6 | 0 |
+| D | Operational data tasks (smoke tests, publish) | 4 | 0 | 4 | 0 |
 | E | Open questions | 0 | 0 | 1 | 0 |
 
 ---
@@ -110,10 +121,12 @@ catalog and the cross-repo `unknown` action-semantics upgrade remain.
   legacy alias key set, root `meta/tasks.json` / `meta/stats.json`, deprecated
   `videos.lance` columns, and v1 format/schema markers with an explicit
   re-conversion diagnostic. Covered by `tests/test_validate_bundle.py`.
-* [ ] **A12.** Producers upgrade `actions.action.body.semantics.command_type`
-  from `"unknown"` to specific values. The converter emits the semantics block,
-  but populating it for RLLAB-collected data is owned by
-  `rllab-data-collection` (see B3) and unblocks training (see B1).
+* [x] **A12.** Producers upgrade the selected action target's
+  `semantics.command_type` from `"unknown"` to a specific value for the known
+  BG2/FFW paths. `lerobot2lance` infers concrete joint-position semantics for
+  ROBOTIS/FFW-family 16-D/19-D/25-D LeRobot sources, the 19-D pretrain builder
+  emits the same concrete `action.body` contract, and unknown non-FFW sources
+  remain intentionally non-training-compatible until explicitly annotated.
 
 ---
 
@@ -131,13 +144,31 @@ back to v1 aliases.
   `manifest.modalities` and `manifest.actions` only. No flat-alias fallback.
 * [x] **B1.3.** Read normalization stats only from `meta/stats/*.json`; remove
   any `meta/stats.json` aggregate fallback.
-* [ ] **B1.4.** Honor `task_segments.end_frame_exclusive` everywhere range math
-  is performed.
-* [ ] **B1.5.** Tolerate / verify the binary `trajectory_sha256` shape.
+* [x] **B1.4.** Honor `task_segments.end_frame_exclusive` everywhere range math
+  is performed. `EpisodeDataset.task_segments(episode_index)` exposes the
+  half-open structs verbatim and the v2 test suite asserts
+  `end_frame_exclusive - start_frame == frame_count` and that the inclusive
+  legacy `end_frame` field is not present. Covered by
+  `test_episode_dataset_exposes_task_segments_half_open`.
+* [x] **B1.5.** Tolerate / verify the binary `trajectory_sha256` shape.
+  `EpisodeDataset` mirrors the v2 magic-prefixed little-endian recipe in
+  `_compute_trajectory_sha256`, exposes `trajectory_sha256(episode_index)` /
+  `verify_trajectory_sha256(episode_index)`, and adds a
+  `DatasetConfig.verify_trajectory_hashes` opt-in that re-derives every
+  episode digest at construction time. Tamper paths fail with a clear
+  mismatch error. Covered by three round-trip / tamper / config tests in
+  `test_published_layout.py`.
 * [x] **B1.6.** Fetch video bytes via `videos.media_id` + Lance Blob v2
   `take_blobs`; never project `video_blob` in metadata scans.
-* [ ] **B1.7.** Use `manifest.actions.action.body.semantics` to configure the
-  action head, and refuse to silently train when `command_type == "unknown"`.
+* [x] **B1.7.** Use the selected training action target's `semantics` block to
+  configure the action contract, and refuse to silently train when required
+  semantics are missing or `unknown`. `EpisodeDataset` resolves the target from
+  `manifest.training_targets` when present, otherwise from the single entry in
+  `manifest.actions`; it does not require the registry key to be
+  `action.body`. It validates `command_type`, `absolute_or_delta`, `units`,
+  `control_frame`, `applies_to_interval`, and `normalized`, exposes
+  `dataset.action_target` / `dataset.action_semantics`, and includes them in
+  `describe()`. Covered by `tests/test_published_layout.py`.
 
 ### B2. `robo_dataview`
 
@@ -155,33 +186,50 @@ silently break the viewer.)
   remains for the frontend / Rerun cache path if a decoder cache is added.
 * [x] **B2.5.** Fetch video bytes via Blob v2 `take_blobs`; do not reach for
   the removed `uri` / `video_path` columns.
-* [ ] **B2.6.** Render `task_segments` as half-open ranges in the UI.
-* [ ] **B2.7.** Surface action semantics (joint vs. EE pose, delta vs.
-  absolute, units, normalization) to the user.
+* [x] **B2.6.** Render `task_segments` as half-open ranges in the UI.
+  Backend `EpisodeDetail` includes typed `task_segments`; the web parser maps
+  them to `Episode.taskSegments`; `EpisodeViewer` renders a clickable
+  half-open segment strip and active task label. Covered by the v2
+  `test_lance_store` media-id regression for API exposure.
+* [x] **B2.7.** Surface action semantics (joint vs. EE pose, delta vs.
+  absolute, units, normalization) to the user. Backend
+  `_action_semantics_from_manifest` lifts
+  `manifest.actions.action.body.semantics` into a typed `ActionSemantics`
+  block on `DatasetSummary`; the web `toDatasetSummary` parser maps it to
+  `actionSemantics`; `EpisodeViewer` accepts an optional `actionSemantics`
+  prop and renders a single-line `summarizeActionSemantics` summary
+  (command_type · absolute/delta · units · control_frame · normalized)
+  under the action plot, threaded through both `browse-mode` and
+  `annotation-mode`. Covered by `test_v2_dataset_summary_surfaces_action_semantics`.
 
 ### B3. `rllab-data-collection`
 
-* [ ] **B3.1.** Publish path emits `rllab_published_lance_dataset_v2` /
-  `schema_version = "2.0"`.
-* [ ] **B3.2.** Manifest includes `lance`, `modalities`, `actions`, `rates`,
-  `capabilities`, and `reader_hints` blocks identical in shape to what
-  `lerobot2lance` emits.
-* [ ] **B3.3.** Action semantics emitted with concrete values
+* [x] **B3.1.** Publish path emits `rllab_published_lance_dataset_v2` /
+  `schema_version = "2.0"` from `tools/publish_dataset.py`.
+* [x] **B3.2.** Manifest includes `lance`, `modalities`, `actions`, `rates`,
+  `capabilities`, and `reader_hints` blocks in the same registry-first shape as
+  `lerobot2lance`.
+* [x] **B3.3.** Action semantics emitted with concrete values
   (`command_type`, `absolute_or_delta`, `units`, `control_frame`,
   `applies_to_interval`, `normalized`); no `"unknown"` placeholders for
-  RLLAB-collected data.
-* [ ] **B3.4.** Video published as Lance Blob v2 inline bytes; external URI
-  blob values rejected at publish time.
-* [ ] **B3.5.** State / action emitted with the FixedSizeList schema
+  RLLAB-collected data. Current publish semantics are joint-position,
+  absolute, mixed-unit, robot-base, unnormalized actions.
+* [x] **B3.4.** Video published as Lance Blob v2 inline bytes using
+  `lance.blob_field` / `lance.blob_array`; publish rejects non-inline blob
+  values before writing.
+* [x] **B3.5.** State / action emitted with the FixedSizeList schema
   documented in A2.
-* [ ] **B3.6.** Denormalized columns `split`, `source_dataset`, `session_id`,
+* [x] **B3.6.** Denormalized columns `split`, `source_dataset`, `session_id`,
   `embodiment_id` populated on `episodes.lance` and `frames.lance`.
-* [ ] **B3.7.** Sidecars limited to canonical files: `meta/info.json`,
+* [x] **B3.7.** Sidecars limited to canonical files: `meta/info.json`,
   `meta/tasks.jsonl`, `meta/episodes.jsonl`, `meta/splits.json`,
   `meta/sessions.json`, and `meta/stats/{name}.json`. Root
-  `meta/tasks.json` / `meta/stats.json` are not emitted (or, if a producer
-  still needs them for an external consumer, they are routed under
-  `meta/compat/`).
+  `meta/tasks.json` / `meta/stats.json` are not emitted.
+
+  Verification: `tests/test_publish_dataset.py` passes under the
+  `rllab-training` venv (`3 passed`), and a synthetic published bundle produced
+  by `tools/publish_dataset.py` passes
+  `lerobot2lance/scripts/validate_bundle.py`.
 
 ---
 
@@ -227,13 +275,18 @@ Forward-looking smoke / publish tasks for fresh v2 bundles. Legacy-bundle
 re-conversion and the pretrain merge re-run that depended on it are out
 of scope — the lab starts from current source data.
 
-* [ ] **D1.** Run `scripts/validate_bundle.py` on each freshly converted
-  v2 bundle and require zero errors.
-* [ ] **D2.** Run `scripts/validate_converted_root.py` over the converted
-  root and require zero errors per bundle.
-* [~] **D3.** Sample `rllab-training` smoke run on a fresh v2 bundle.
-  Loader/normalizer/inspect smoke passed on the ubless v2 probe bundle; a
-  short optimizer training step remains if needed.
+* [x] **D1.** Run `scripts/validate_bundle.py` on each freshly converted
+  v2 bundle and require zero errors. Verified on
+  `data/probes/ubless_v2_final`.
+* [x] **D2.** Run `scripts/validate_converted_root.py` over the converted
+  root and require zero errors per bundle. Verified over `data/probes`
+  (`ubless_v2_final`, `ubless_v2_verify`: 2 passed, 0 failed).
+* [x] **D3.** Sample `rllab-training` smoke run on a fresh v2 bundle.
+  `rllab-inspect-dataset` reports 10 episodes / 3150 frames, 19-D state/action,
+  3 cameras, `action_target = action.body`, and concrete joint-position
+  semantics. A 2-step optimizer smoke run completed
+  (`step=1 loss=1.122010`, `step=2 loss=1.123513`, `val_loss=1.113266`) and
+  `rllab-infer` reloaded the checkpoint and produced a 19-D action.
 * [x] **D4.** Sample `robo_dataview` backend smoke run on a converted bundle:
   ubless v2 probe opens, summarizes 10 episodes / 3150 frames, lists 3 cameras,
   returns 322-frame state/action timeseries for episode 0, and fetches the

@@ -1236,6 +1236,7 @@ def build_manifest(
         },
         "modalities": build_modalities(camera_keys, camera_columns, fps_for_registry),
         "actions": build_actions(fps_for_registry),
+        "training_targets": ["action.body"],
         "rates": {
             "fps": primary_fps,
             "fps_values": fps_values,
@@ -1439,10 +1440,10 @@ def build_actions(fps: float) -> dict[str, Any]:
             "stats": "meta/stats/action_body.json",
             "alignment": "same_frame_timestamp",
             "semantics": {
-                "command_type": "unknown",
-                "absolute_or_delta": "unknown",
-                "units": "unknown",
-                "control_frame": "unknown",
+                "command_type": "joint_position",
+                "absolute_or_delta": "absolute",
+                "units": "mixed",
+                "control_frame": "robot_base",
                 "applies_to_interval": "[t_i, t_{i+1})",
                 "normalized": False,
             },

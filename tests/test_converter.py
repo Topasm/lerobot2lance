@@ -48,6 +48,8 @@ def _write_v2_1_dataset(
     episodes: int = 2,
     length: int = 4,
     nonfinite_state: bool = False,
+    vector_dim: int = 3,
+    robot_type: str | None = None,
 ) -> None:
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
@@ -70,10 +72,12 @@ def _write_v2_1_dataset(
                     "video.pix_fmt": "yuv420p",
                 },
             },
-            "observation.state": {"dtype": "float32", "shape": [3]},
-            "action": {"dtype": "float32", "shape": [3]},
+            "observation.state": {"dtype": "float32", "shape": [vector_dim]},
+            "action": {"dtype": "float32", "shape": [vector_dim]},
         },
     }
+    if robot_type is not None:
+        info["robot_type"] = robot_type
     (root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
     (root / "meta" / "tasks.jsonl").write_text(
         json.dumps({"task_index": 0, "task": "pick-and-place"}) + "\n",
@@ -99,11 +103,14 @@ def _write_v2_1_dataset(
                 "index": ep * length + f,
                 "task_index": 0,
                 "observation.state": [
-                    float(ep),
-                    float(f),
-                    float("nan") if nonfinite_state and ep == 0 and f == 0 else 0.0,
+                    (
+                        float("nan")
+                        if nonfinite_state and ep == 0 and f == 0 and i == 0
+                        else float(ep + f + i)
+                    )
+                    for i in range(vector_dim)
                 ],
-                "action": [float(ep), float(f), 1.0],
+                "action": [float(ep + f + i + 1) for i in range(vector_dim)],
             }
             for f in range(length)
         ]
@@ -114,8 +121,8 @@ def _write_v2_1_dataset(
                 ("episode_index", pa.int64()),
                 ("index", pa.int64()),
                 ("task_index", pa.int64()),
-                ("observation.state", pa.list_(pa.float32(), 3)),
-                ("action", pa.list_(pa.float32(), 3)),
+                ("observation.state", pa.list_(pa.float32(), vector_dim)),
+                ("action", pa.list_(pa.float32(), vector_dim)),
             ]
         )
         pq.write_table(
@@ -610,6 +617,7 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(manifest["counts"]["videos"], 2)
             self.assertEqual(manifest["modalities"]["state.body"]["column"], "observation_state")
             self.assertEqual(manifest["actions"]["action.body"]["column"], "actions")
+            self.assertEqual(manifest["training_targets"], ["action.body"])
             semantics = manifest["actions"]["action.body"]["semantics"]
             for key in (
                 "command_type",
@@ -641,6 +649,33 @@ class LerobotToLanceConversionTest(unittest.TestCase):
                 "total_video_segments",
             ):
                 self.assertNotIn(forbidden, manifest, f"flat alias leaked: {forbidden}")
+
+    def test_ffw_robot_type_gets_concrete_joint_action_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "lerobot"
+            target = Path(tmpdir) / "published"
+            _write_v2_1_dataset(
+                source,
+                episodes=2,
+                length=3,
+                vector_dim=19,
+                robot_type="ffw_bg2_rev4",
+            )
+
+            convert_lerobot_to_lance(
+                source,
+                target,
+                output_layout="hf",
+                dataset_id="rllab-postech/bg2-test",
+            )
+
+            manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+            semantics = manifest["actions"]["action.body"]["semantics"]
+            self.assertEqual(semantics["command_type"], "joint_position")
+            self.assertEqual(semantics["absolute_or_delta"], "absolute")
+            self.assertEqual(semantics["units"], "mixed")
+            self.assertEqual(semantics["control_frame"], "robot_base")
+            self.assertIs(semantics["normalized"], False)
             self.assertNotIn("stats", manifest.get("meta", {}))
             self.assertNotIn("tasks", manifest.get("meta", {}))
 
@@ -666,11 +701,11 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             )
             self.assertEqual(
                 frames_ds.schema.field("observation_state").type,
-                pa.list_(pa.float32(), 3),
+                pa.list_(pa.float32(), 19),
             )
             self.assertEqual(
                 episodes.schema.field("observation_state").type,
-                pa.large_list(pa.list_(pa.float32(), 3)),
+                pa.large_list(pa.list_(pa.float32(), 19)),
             )
 
             def _index_types(ds) -> dict[str, str]:
