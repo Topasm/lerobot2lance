@@ -45,6 +45,12 @@ converted from, not that the published bundle is a drop-in replacement for
 LeRobot v3's chunked Parquet/MP4 directory tree. Reverse export to native
 LeRobot v2.1/v3 directory layout is outside the v2 contract.
 
+RLLAB-collected bundles emit `source_format = "rllab_raw_rosbag_session_v1"`
+when produced directly from a raw rosbag+MCAP session via
+`rllab-data-collection/tools/publish_raw_dataset.py`. The published v2
+bundle is the same shape regardless of which source pipeline produced it —
+the discriminator is `source_format`, not the storage layout.
+
 ## 2. Directory layout
 
 ```text
@@ -85,7 +91,7 @@ for non-LeRobot sources that cannot provide `meta/info.json.features.*.names`.
 | `dataset_id` | string | stable identifier; HF repo path when published |
 | `created_at` | ISO-8601 string | UTC conversion timestamp |
 | `source` | string | source path/repo/provenance descriptor; object form is reserved and not valid in v2.0 |
-| `source_format` | string | source layout, e.g. `lerobot_v2_1`, `lerobot_v3`, or RLLAB source format |
+| `source_format` | string | source layout. Known values: `lerobot_v2_1`, `lerobot_v3` (HF LeRobot tree input to `lerobot2lance`); `rllab_raw_rosbag_session_v1` (raw rosbag+MCAP session published directly by `rllab-data-collection/tools/publish_raw_dataset.py`); other RLLAB source formats may be added with the same string-tagged convention |
 | `lance` | object | Lance file/storage contract; see §3.4 |
 | `primary_training_table` | string | manifest-selected training table; default conversion uses `data/episodes.lance`, merged/pretrain bundles may use `data/train_episodes.lance` |
 | `counts` | object | canonical counts: `episodes`, `frames`, `videos`, plus optional task/source counts |
