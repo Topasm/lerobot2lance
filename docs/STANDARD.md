@@ -363,7 +363,7 @@ The `video_blob` field must be a Lance Blob v2 column created with
 `data_storage_version >= 2.2`. Metadata scans must not project `video_blob`;
 byte readers must use Lance blob access such as `take_blobs()`.
 
-**Inline-only policy.** Published v1 bundles MUST contain inline byte blobs.
+**Inline-only policy.** Published v2 bundles MUST contain inline byte blobs.
 External-URI blob values and external URI slices, which Lance Blob v2 can also
 represent, are **not** valid `video_blob` content in this contract; bundles are
 expected to be self-contained.
@@ -736,7 +736,7 @@ SCALAR_INDEXES = {
 
 ## 13. Out of scope
 
-The following are intentionally outside the core v1 standard:
+The following are intentionally outside the core v2 standard:
 
 - External MP4 file trees as primary storage.
 - Per-frame keyframe materialization (`keyframes.lance`).

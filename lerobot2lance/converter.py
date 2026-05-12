@@ -16,6 +16,7 @@ columns are not written by this converter.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
@@ -98,6 +99,104 @@ CONVERSION_REPORT_KEYS = (
     "cameras",
 )
 
+FFW_BG2_REV4_JOINT_ORDER = [
+    "arm_l_joint1",
+    "arm_l_joint2",
+    "arm_l_joint3",
+    "arm_l_joint4",
+    "arm_l_joint5",
+    "arm_l_joint6",
+    "arm_l_joint7",
+    "gripper_l_joint1",
+    "arm_r_joint1",
+    "arm_r_joint2",
+    "arm_r_joint3",
+    "arm_r_joint4",
+    "arm_r_joint5",
+    "arm_r_joint6",
+    "arm_r_joint7",
+    "gripper_r_joint1",
+    "head_joint1",
+    "head_joint2",
+    "lift_joint",
+]
+
+def _ffw_joint_spec(
+    component: str,
+    side: str,
+    role: str,
+    urdf_joint_type: str,
+    axis: list[float],
+    lower: float,
+    upper: float,
+    *,
+    velocity: float = 4.8,
+    effort: float = 1000.0,
+    mimic_driver: bool = False,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "component": component,
+        "side": side,
+        "role": role,
+        "urdf_joint_type": urdf_joint_type,
+        "axis": axis,
+        "lower": lower,
+        "upper": upper,
+        "velocity": velocity,
+        "effort": effort,
+    }
+    if mimic_driver:
+        spec["mimic_driver"] = True
+    return spec
+
+
+# Derived from:
+# - rllab-data-collection/config/bg2_topics.yaml target_order
+# - ai_worker/ffw_description/urdf/ffw_bg2_rev4_follower/ffw_bg2_follower.urdf
+# The converter stores these as manifest metadata so downstream training code can
+# distinguish arms, grippers, head, and lift without hard-coding column indices.
+FFW_BG2_REV4_JOINT_SPECS: dict[str, dict[str, Any]] = {
+    "arm_l_joint1": _ffw_joint_spec("left_arm", "left", "arm", "revolute", [0.0, 1.0, 0.0], -3.14, 3.14),
+    "arm_l_joint2": _ffw_joint_spec("left_arm", "left", "arm", "revolute", [1.0, 0.0, 0.0], 0.0, 3.14),
+    "arm_l_joint3": _ffw_joint_spec("left_arm", "left", "arm", "revolute", [0.0, 0.0, 1.0], -3.14, 3.14),
+    "arm_l_joint4": _ffw_joint_spec("left_arm", "left", "arm", "revolute", [0.0, 1.0, 0.0], -2.9361, 1.0786),
+    "arm_l_joint5": _ffw_joint_spec("left_arm", "left", "arm", "revolute", [0.0, 0.0, 1.0], -3.14, 3.14),
+    "arm_l_joint6": _ffw_joint_spec("left_arm", "left", "arm", "revolute", [0.0, 1.0, 0.0], -1.57, 1.57),
+    "arm_l_joint7": _ffw_joint_spec("left_arm", "left", "arm", "revolute", [1.0, 0.0, 0.0], -1.8201, 1.5804),
+    "gripper_l_joint1": _ffw_joint_spec(
+        "left_gripper",
+        "left",
+        "gripper",
+        "revolute",
+        [1.0, 0.0, 0.0],
+        0.0,
+        1.1,
+        velocity=6.5,
+        mimic_driver=True,
+    ),
+    "arm_r_joint1": _ffw_joint_spec("right_arm", "right", "arm", "revolute", [0.0, 1.0, 0.0], -3.14, 3.14),
+    "arm_r_joint2": _ffw_joint_spec("right_arm", "right", "arm", "revolute", [1.0, 0.0, 0.0], -3.14, 0.0),
+    "arm_r_joint3": _ffw_joint_spec("right_arm", "right", "arm", "revolute", [0.0, 0.0, 1.0], -3.14, 3.14),
+    "arm_r_joint4": _ffw_joint_spec("right_arm", "right", "arm", "revolute", [0.0, 1.0, 0.0], -2.9361, 1.0786),
+    "arm_r_joint5": _ffw_joint_spec("right_arm", "right", "arm", "revolute", [0.0, 0.0, 1.0], -3.14, 3.14),
+    "arm_r_joint6": _ffw_joint_spec("right_arm", "right", "arm", "revolute", [0.0, 1.0, 0.0], -1.57, 1.57),
+    "arm_r_joint7": _ffw_joint_spec("right_arm", "right", "arm", "revolute", [1.0, 0.0, 0.0], -1.5804, 1.8201),
+    "gripper_r_joint1": _ffw_joint_spec(
+        "right_gripper",
+        "right",
+        "gripper",
+        "revolute",
+        [1.0, 0.0, 0.0],
+        0.0,
+        1.1,
+        velocity=6.5,
+        mimic_driver=True,
+    ),
+    "head_joint1": _ffw_joint_spec("head", "center", "head", "revolute", [0.0, 1.0, 0.0], -0.2317, 0.6951),
+    "head_joint2": _ffw_joint_spec("head", "center", "head", "revolute", [0.0, 0.0, 1.0], -0.35, 0.35),
+    "lift_joint": _ffw_joint_spec("lift", "center", "lift", "prismatic", [0.0, 0.0, 1.0], -0.5, 0.0),
+}
+
 
 def convert_lerobot_to_lance(
     source: str | Path,
@@ -171,10 +270,10 @@ def convert_lerobot_to_lance(
     frame_rows: list[dict[str, Any]] = []
     episode_rows: list[dict[str, Any]] = []
     media_rows: list[dict[str, Any]] = []
-    seen_video_paths: set[str] = set()
     source_repo_id = _source_repo_id(info, source)
     split_by_episode: dict[int, str] = {}
     resolved_session_id = session_id or source_repo_id or dataset_id
+    next_global_frame_index = 0
 
     total = len(episode_meta_rows)
     for ordinal, meta_row in enumerate(episode_meta_rows):
@@ -242,20 +341,14 @@ def convert_lerobot_to_lance(
         }
 
         if include_frames:
-            for frame in ep_frames:
-                frame_index = int(frame.get("frame_index", frame.get("index", 0)))
+            for frame_index, frame in enumerate(ep_frames):
                 state = _as_float_list(frame.get("observation.state"))
                 action = _as_float_list(frame.get("action"))
                 frame_rows.append(
                     {
                         "episode_index": episode_index,
                         "frame_index": frame_index,
-                        "global_frame_index": int(
-                            frame.get(
-                                "index",
-                                episode_index * len(ep_frames) + frame_index,
-                            )
-                        ),
+                        "global_frame_index": next_global_frame_index,
                         "timestamp": float(frame.get("timestamp") or 0.0),
                         "task_index": int(
                             frame.get("task_index") or episode_task_index or 0
@@ -271,6 +364,7 @@ def convert_lerobot_to_lance(
                         "embodiment_id": embodiment_id,
                     }
                 )
+                next_global_frame_index += 1
 
         for camera_key, camera_norm in zip(camera_keys, cameras_norm):
             feature_info = (info.get("features") or {}).get(camera_key) or {}
@@ -297,27 +391,24 @@ def convert_lerobot_to_lance(
                 )
             )
 
-            video_key = str(video_path.resolve())
-            if video_key not in seen_video_paths:
-                seen_video_paths.add(video_key)
-                media_rows.append(
-                    _media_row(
-                        info=info,
-                        camera_key=camera_key,
-                        camera_norm=camera_norm,
-                        video_path=video_path,
-                        source=source,
-                        source_repo_id=source_repo_id,
-                        blob=blob,
-                        episode_index=episode_index,
-                        chunk_index=chunk_index,
-                        fps=fps,
-                        num_frames=len(ep_frames),
-                        session_id=resolved_session_id,
-                        embodiment_id=embodiment_id,
-                        feature_info=feature_info,
-                    )
+            media_rows.append(
+                _media_row(
+                    info=info,
+                    camera_key=camera_key,
+                    camera_norm=camera_norm,
+                    video_path=video_path,
+                    source=source,
+                    source_repo_id=source_repo_id,
+                    blob=blob,
+                    episode_index=episode_index,
+                    chunk_index=chunk_index,
+                    fps=fps,
+                    num_frames=len(ep_frames),
+                    session_id=resolved_session_id,
+                    embodiment_id=embodiment_id,
+                    feature_info=feature_info,
                 )
+            )
 
         episode_rows.append(episode_row)
         if progress_callback:
@@ -334,6 +425,12 @@ def convert_lerobot_to_lance(
 
     state_dim = _episode_vector_dim(episode_rows, "observation_state")
     action_dim = _episode_vector_dim(episode_rows, "actions")
+    info = _with_inferred_ffw_feature_names(
+        info,
+        source_repo_id=source_repo_id,
+        state_dim=state_dim,
+        action_dim=action_dim,
+    )
 
     episodes_schema = _build_episodes_schema(
         pa,
@@ -365,7 +462,7 @@ def convert_lerobot_to_lance(
             scalar_indexes=SCALAR_INDEXES["frames"],
         )
 
-    if media_rows:
+    if media_rows or output_layout == "hf":
         media_schema = _build_media_schema(pa, lance)
         media_table = _table_from_pylist_with_blob_columns(
             pa,
@@ -1201,6 +1298,7 @@ def _build_modalities(
     episodes_path: str,
     frames_path: str,
     media_path: str,
+    state_semantics: dict[str, Any],
 ) -> dict[str, Any]:
     modalities: dict[str, Any] = {
         "state.body": {
@@ -1217,6 +1315,7 @@ def _build_modalities(
             "shape_policy": "single",
             "rate_hz": float(fps),
             "stats": "meta/stats/state_body.json",
+            "semantics": dict(state_semantics),
         }
     }
     for camera_key, camera_norm in zip(camera_keys, cameras_norm):
@@ -1249,6 +1348,172 @@ def _default_unknown_action_semantics() -> dict[str, Any]:
     }
 
 
+def _default_unknown_state_semantics() -> dict[str, Any]:
+    return {
+        "observation_type": "unknown",
+        "units": "unknown",
+        "control_frame": "unknown",
+        "normalized": False,
+    }
+
+
+def _feature_names(info: dict[str, Any], feature_key: str, dim: int) -> list[str]:
+    feature = (info.get("features") or {}).get(feature_key) or {}
+    names = feature.get("names")
+    if isinstance(names, list) and len(names) == int(dim) and all(isinstance(name, str) for name in names):
+        return list(names)
+    return []
+
+
+def _has_specific_ffw_names(info: dict[str, Any], feature_key: str, dim: int) -> bool:
+    names = _feature_names(info, feature_key, dim)
+    return bool(names) and all(name in FFW_BG2_REV4_JOINT_SPECS for name in names)
+
+
+def _is_ffw_family(info: dict[str, Any], source_repo_id: str | None) -> bool:
+    robot_type = str(info.get("robot_type") or "").lower()
+    robot_name = str(info.get("robot_name") or "").lower()
+    repo = str(source_repo_id or "").lower()
+    return (
+        robot_type.startswith("ffw_")
+        or robot_name.startswith("ffw_")
+        or "ffw_bg2" in repo
+        or "ffw_sg2" in repo
+        or "ffw_arm_only" in repo
+        or repo.startswith(("robotis/", "robotissw/", "dongkkka/"))
+    )
+
+
+def _ffw_joint_order_for_dim(dim: int, names: list[str]) -> list[str]:
+    if names and all(name in FFW_BG2_REV4_JOINT_SPECS for name in names):
+        return list(names)
+    if int(dim) == 19:
+        return list(FFW_BG2_REV4_JOINT_ORDER)
+    if int(dim) == 16:
+        return list(FFW_BG2_REV4_JOINT_ORDER[:16])
+    return []
+
+
+def _with_inferred_ffw_feature_names(
+    info: dict[str, Any],
+    *,
+    source_repo_id: str | None,
+    state_dim: int,
+    action_dim: int,
+) -> dict[str, Any]:
+    """Upgrade generic FFW feature names to the inferred joint order.
+
+    Some public LeRobot datasets advertise 19-D BG2 arrays but keep generic
+    names such as ``joint_0`` for ``action``. The v2 registry points readers to
+    meta/info.json via names_ref, so when we can infer the FFW layout from
+    robot metadata and dimensionality, info.json should carry those names too.
+    """
+
+    if not _is_ffw_family(info, source_repo_id):
+        return info
+    out = deepcopy(info)
+    features = out.setdefault("features", {})
+    if not isinstance(features, dict):
+        return out
+    for feature_key, dim in (
+        ("observation.state", state_dim),
+        ("action", action_dim),
+    ):
+        joint_order = _ffw_joint_order_for_dim(dim, _feature_names(out, feature_key, dim))
+        if not joint_order or _has_specific_ffw_names(out, feature_key, dim):
+            continue
+        feature = features.setdefault(feature_key, {})
+        if isinstance(feature, dict):
+            feature["names"] = list(joint_order)
+    return out
+
+
+def _ffw_joint_groups(joint_order: list[str]) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for component, role, side in (
+        ("left_arm", "arm", "left"),
+        ("left_gripper", "gripper", "left"),
+        ("right_arm", "arm", "right"),
+        ("right_gripper", "gripper", "right"),
+        ("head", "head", "center"),
+        ("lift", "lift", "center"),
+    ):
+        indices = [
+            index
+            for index, name in enumerate(joint_order)
+            if FFW_BG2_REV4_JOINT_SPECS.get(name, {}).get("component") == component
+        ]
+        if not indices:
+            continue
+        groups.append(
+            {
+                "name": component,
+                "role": role,
+                "side": side,
+                "indices": indices,
+                "joint_names": [joint_order[index] for index in indices],
+            }
+        )
+    return groups
+
+
+def _ffw_joint_layout(joint_order: list[str]) -> dict[str, Any]:
+    joints = []
+    for index, name in enumerate(joint_order):
+        spec = dict(FFW_BG2_REV4_JOINT_SPECS[name])
+        urdf_joint_type = str(spec["urdf_joint_type"])
+        unit = "m" if urdf_joint_type == "prismatic" else "rad"
+        joints.append(
+            {
+                "index": index,
+                "name": name,
+                "component": spec["component"],
+                "role": spec["role"],
+                "side": spec["side"],
+                "unit": unit,
+                "urdf_joint_type": urdf_joint_type,
+                "axis": spec["axis"],
+                "position_limit": {
+                    "lower": spec["lower"],
+                    "upper": spec["upper"],
+                },
+                "velocity_limit": spec["velocity"],
+                "effort_limit": spec["effort"],
+                **({"mimic_driver": True} if spec.get("mimic_driver") else {}),
+            }
+        )
+    return {
+        "robot_type": "ffw_bg2_rev4",
+        "urdf_source": "ai_worker/ffw_description/urdf/ffw_bg2_rev4_follower/ffw_bg2_follower.urdf",
+        "collection_source": "rllab-data-collection/config/bg2_topics.yaml",
+        "joint_order": list(joint_order),
+        "groups": _ffw_joint_groups(joint_order),
+        "joints": joints,
+    }
+
+
+def _infer_state_semantics(
+    info: dict[str, Any],
+    *,
+    source_repo_id: str | None,
+    state_dim: int,
+) -> dict[str, Any]:
+    if _is_ffw_family(info, source_repo_id):
+        joint_order = _ffw_joint_order_for_dim(
+            state_dim,
+            _feature_names(info, "observation.state", state_dim),
+        )
+        if joint_order:
+            return {
+                "observation_type": "joint_position",
+                "units": "mixed",
+                "control_frame": "robot_base",
+                "normalized": False,
+                "joint_layout": _ffw_joint_layout(joint_order),
+            }
+    return _default_unknown_state_semantics()
+
+
 def _infer_action_semantics(
     info: dict[str, Any],
     *,
@@ -1263,19 +1528,8 @@ def _infer_action_semantics(
     and dimensionality match the FFW joint-position recordings we use for BG2.
     """
 
-    robot_type = str(info.get("robot_type") or "").lower()
-    robot_name = str(info.get("robot_name") or "").lower()
-    repo = str(source_repo_id or "").lower()
-    ffw_family = (
-        robot_type.startswith("ffw_")
-        or robot_name.startswith("ffw_")
-        or "ffw_bg2" in repo
-        or "ffw_sg2" in repo
-        or "ffw_arm_only" in repo
-        or repo.startswith(("robotis/", "robotissw/", "dongkkka/"))
-    )
-    if ffw_family and int(action_dim) in {16, 19, 25}:
-        return {
+    if _is_ffw_family(info, source_repo_id) and int(action_dim) in {16, 19, 25}:
+        semantics = {
             "command_type": "joint_position",
             "absolute_or_delta": "absolute",
             "units": "mixed",
@@ -1283,6 +1537,13 @@ def _infer_action_semantics(
             "applies_to_interval": "[t_i, t_{i+1})",
             "normalized": False,
         }
+        joint_order = _ffw_joint_order_for_dim(
+            action_dim,
+            _feature_names(info, "action", action_dim),
+        )
+        if joint_order:
+            semantics["joint_layout"] = _ffw_joint_layout(joint_order)
+        return semantics
     return _default_unknown_action_semantics()
 
 
@@ -1380,19 +1641,25 @@ def _write_manifest(
     episodes_path = "data/episodes.lance" if is_hf else "episodes.lance"
     frames_path = "data/frames.lance" if is_hf else "frames.lance"
     media_path = "data/videos.lance" if is_hf else "media.lance"
+    has_videos_table = bool(has_media or is_hf)
     tables = {
         "episodes": episodes_path,
         "primary_training": episodes_path,
     }
     if include_frames:
         tables["frames"] = frames_path
-    if has_media:
+    if has_videos_table:
         tables["videos" if is_hf else "media"] = media_path
 
     action_semantics = _infer_action_semantics(
         info,
         source_repo_id=source_repo_id,
         action_dim=action_dim,
+    )
+    state_semantics = _infer_state_semantics(
+        info,
+        source_repo_id=source_repo_id,
+        state_dim=state_dim,
     )
 
     manifest = {
@@ -1431,6 +1698,7 @@ def _write_manifest(
             episodes_path=episodes_path,
             frames_path=frames_path,
             media_path=media_path,
+            state_semantics=state_semantics,
         ),
         "actions": _build_actions(
             action_dim=action_dim,
@@ -1450,8 +1718,8 @@ def _write_manifest(
         },
         "capabilities": {
             "inline_video_blobs": bool(has_media),
-            "lance_blob_v2": bool(has_media),
-            "videos_table": bool(has_media),
+            "lance_blob_v2": bool(has_videos_table),
+            "videos_table": bool(has_videos_table),
             "frames_table": bool(include_frames),
             "modality_registry_v2": True,
             "fixed_size_state_action": True,
@@ -1465,7 +1733,7 @@ def _write_manifest(
             "prefer_registry": True,
             "video_lookup": "videos.media_id",
             "normalization": "meta/stats",
-            "lazy_blob_columns": {media_path: ["video_blob"]} if has_media else {},
+            "lazy_blob_columns": {media_path: ["video_blob"]} if has_videos_table else {},
             "blob_read_api": "take_blobs",
             "default_projections": {
                 "frames_training": [
@@ -1500,7 +1768,7 @@ def _write_manifest(
                             "max_rows_per_file": VIDEOS_MAX_ROWS_PER_FILE,
                         }
                     }
-                    if has_media
+                    if has_videos_table
                     else {}
                 ),
             },
@@ -1510,7 +1778,7 @@ def _write_manifest(
                 indexes_built or {},
                 episodes_path=episodes_path,
                 frames_path=frames_path if include_frames else None,
-                media_path=media_path if has_media else None,
+                media_path=media_path if has_videos_table else None,
             ),
             "recommended": [
                 {"table": episodes_path, "columns": ["episode_index"]},
@@ -1521,7 +1789,7 @@ def _write_manifest(
                 ),
                 *(
                     [{"table": media_path, "columns": ["media_id", "episode_index", "camera_id"]}]
-                    if has_media
+                    if has_videos_table
                     else []
                 ),
             ],

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from lerobot2lance import convert_lerobot_to_lance
+from lerobot2lance.converter import FFW_BG2_REV4_JOINT_ORDER
 
 
 try:
@@ -676,6 +677,52 @@ class LerobotToLanceConversionTest(unittest.TestCase):
             self.assertEqual(semantics["units"], "mixed")
             self.assertEqual(semantics["control_frame"], "robot_base")
             self.assertIs(semantics["normalized"], False)
+            layout = semantics["joint_layout"]
+            self.assertEqual(layout["robot_type"], "ffw_bg2_rev4")
+            self.assertEqual(layout["joint_order"], FFW_BG2_REV4_JOINT_ORDER)
+            self.assertEqual(layout["groups"][0]["name"], "left_arm")
+            self.assertEqual(layout["groups"][0]["indices"], list(range(7)))
+            self.assertEqual(layout["groups"][1]["name"], "left_gripper")
+            self.assertEqual(layout["groups"][1]["indices"], [7])
+            self.assertEqual(layout["groups"][4]["name"], "head")
+            self.assertEqual(layout["groups"][4]["indices"], [16, 17])
+            self.assertEqual(layout["groups"][5]["name"], "lift")
+            self.assertEqual(layout["groups"][5]["indices"], [18])
+            self.assertEqual(
+                layout["joints"][1]["position_limit"],
+                {"lower": 0.0, "upper": 3.14},
+            )
+            self.assertEqual(layout["joints"][3]["axis"], [0.0, 1.0, 0.0])
+            self.assertEqual(
+                layout["joints"][3]["position_limit"],
+                {"lower": -2.9361, "upper": 1.0786},
+            )
+            self.assertEqual(layout["joints"][7]["role"], "gripper")
+            self.assertEqual(layout["joints"][7]["unit"], "rad")
+            self.assertTrue(layout["joints"][7]["mimic_driver"])
+            self.assertEqual(
+                layout["joints"][14]["position_limit"],
+                {"lower": -1.5804, "upper": 1.8201},
+            )
+            self.assertEqual(layout["joints"][18]["urdf_joint_type"], "prismatic")
+            self.assertEqual(layout["joints"][18]["unit"], "m")
+            state_semantics = manifest["modalities"]["state.body"]["semantics"]
+            self.assertEqual(state_semantics["observation_type"], "joint_position")
+            self.assertEqual(
+                state_semantics["joint_layout"]["joint_order"],
+                FFW_BG2_REV4_JOINT_ORDER,
+            )
+            published_info = json.loads(
+                (target / "meta" / "info.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                published_info["features"]["observation.state"]["names"],
+                FFW_BG2_REV4_JOINT_ORDER,
+            )
+            self.assertEqual(
+                published_info["features"]["action"]["names"],
+                FFW_BG2_REV4_JOINT_ORDER,
+            )
             self.assertNotIn("stats", manifest.get("meta", {}))
             self.assertNotIn("tasks", manifest.get("meta", {}))
 

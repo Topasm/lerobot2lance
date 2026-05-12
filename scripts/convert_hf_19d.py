@@ -240,17 +240,17 @@ def stamp_manifest(target_dir: Path, row: dict[str, Any], dataset_id: str) -> No
         if not path.exists():
             continue
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        manifest.update(
-            {
-                "dataset_id": dataset_id,
-                "source_dataset": row["repo_id"],
-                "source_repo_id": row["repo_id"],
-                "source_namespace": row["repo_id"].split("/", 1)[0],
-                "source_robot_type": row.get("robot_type"),
-                "source_robot_name": row.get("robot_name"),
-                "pretrain_tier": pretrain_tier(row),
-            }
-        )
+        manifest["dataset_id"] = dataset_id
+        manifest["provenance"] = {
+            **(manifest.get("provenance") or {}),
+            "source_repo_id": row["repo_id"],
+            "source_namespace": row["repo_id"].split("/", 1)[0],
+            "source_robot_type": row.get("robot_type"),
+            "source_robot_name": row.get("robot_name"),
+            "pretrain_tier": pretrain_tier(row),
+        }
+        for legacy_key in ("source_dataset", "source_repo_id", "source_dataset_url"):
+            manifest.pop(legacy_key, None)
         path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 

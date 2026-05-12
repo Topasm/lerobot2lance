@@ -25,6 +25,7 @@ def _write_converted_19d_bundle(
     repo_id: str,
     camera_key: str,
     camera_column: str,
+    fps: float = 10.0,
 ) -> None:
     bundle = root / name
     (bundle / "data").mkdir(parents=True)
@@ -36,9 +37,9 @@ def _write_converted_19d_bundle(
         {
             "episode_index": 0,
             "task_index": 0,
-            "fps": 10.0,
+            "fps": fps,
             "length": 2,
-            "timestamps": [0.0, 0.1],
+            "timestamps": [0.0, 1.0 / fps],
             "observation_state": states,
             "actions": actions,
             "language_instruction": "pick",
@@ -48,7 +49,7 @@ def _write_converted_19d_bundle(
                     "camera_column": camera_column,
                     "media_id": f"episode_00000000_{camera_column}",
                     "from_timestamp": 0.0,
-                    "to_timestamp": 0.1,
+                    "to_timestamp": 1.0 / fps,
                     "frame_start": 0,
                     "frame_count": 2,
                 }
@@ -60,10 +61,10 @@ def _write_converted_19d_bundle(
                     "start_frame": 0,
                     "end_frame_exclusive": 2,
                     "start_timestamp": 0.0,
-                    "end_timestamp_exclusive": 0.2,
+                    "end_timestamp_exclusive": 2.0 / fps,
                 }
             ],
-            "trajectory_sha256": _trajectory_sha256([0.0, 0.1], states, actions),
+            "trajectory_sha256": _trajectory_sha256([0.0, 1.0 / fps], states, actions),
             "split": "train",
             "source_dataset": repo_id,
             "source_episode_index": 0,
@@ -76,7 +77,7 @@ def _write_converted_19d_bundle(
             "episode_index": 0,
             "frame_index": frame,
             "global_frame_index": frame,
-            "timestamp": frame / 10.0,
+            "timestamp": frame / fps,
             "task_index": 0,
             "observation_state": states[frame],
             "action": actions[frame],
@@ -114,7 +115,7 @@ def _write_converted_19d_bundle(
             "relative_path": "videos/episode_000000.mp4",
             "video_blob": b"abc",
             "from_timestamp": 0.0,
-            "to_timestamp": 0.1,
+            "to_timestamp": 1.0 / fps,
             "num_frames": 2,
             "chunk_index": 0,
             "file_index": 0,
@@ -122,7 +123,7 @@ def _write_converted_19d_bundle(
             "byte_size": 3,
             "width_pixels": 320,
             "height_pixels": 240,
-            "fps": 10.0,
+            "fps": fps,
             "codec": "h264",
         }
     ]
@@ -270,7 +271,7 @@ def _write_converted_19d_bundle(
             },
         },
         "actions": {"action.body": {"kind": "action", "shape": [19], "shape_policy": "single"}},
-        "rates": {"fps": 10.0},
+        "rates": {"fps": fps},
         "counts": {"episodes": 1, "frames": 2, "videos": 1},
         "tables": {
             "episodes": "data/episodes.lance",
@@ -294,6 +295,81 @@ def _table_with_blob(pa: object, rows: list[dict], schema: object, blob_column: 
 
 @unittest.skipUnless(HAS_LANCE_DEPS, "requires pyarrow + lance")
 class PretrainBuilderTest(unittest.TestCase):
+    def test_discover_sources_uses_provenance_quality(self) -> None:
+        import tempfile
+
+        from scripts.build_pretrain_19d_lance import discover_sources
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            converted = tmp / "converted_19d"
+            _write_converted_19d_bundle(
+                converted,
+                name="Org__demo_dataset",
+                repo_id="Org__demo_dataset",
+                camera_key="observation.images.cam_head",
+                camera_column="observation_images_cam_head",
+            )
+            manifest_path = converted / "Org__demo_dataset" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("source_repo_id", None)
+            manifest["provenance"] = {
+                "source_repo_id": "Org/demo_dataset",
+                "source_dataset_url": "https://huggingface.co/datasets/Org/demo_dataset",
+                "quality_flag": "review_name",
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            rows = discover_sources(
+                converted,
+                strict_bg2_only=False,
+                include_review_names=False,
+            )
+            self.assertEqual(rows, [])
+
+            rows = discover_sources(
+                converted,
+                strict_bg2_only=False,
+                include_review_names=True,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["source_repo_id"], "Org/demo_dataset")
+            self.assertEqual(rows[0]["source_url"], "https://huggingface.co/datasets/Org/demo_dataset")
+            self.assertEqual(rows[0]["quality_flag"], "review_name")
+
+    def test_discover_sources_excludes_high_fps_by_default(self) -> None:
+        import tempfile
+
+        from scripts.build_pretrain_19d_lance import discover_sources
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            converted = tmp / "converted_19d"
+            _write_converted_19d_bundle(
+                converted,
+                name="fast",
+                repo_id="Org/Fast",
+                camera_key="observation.images.cam_head",
+                camera_column="observation_images_cam_head",
+                fps=120.0,
+            )
+
+            rows = discover_sources(
+                converted,
+                strict_bg2_only=False,
+                include_review_names=False,
+            )
+            self.assertEqual(rows, [])
+
+            rows = discover_sources(
+                converted,
+                strict_bg2_only=False,
+                include_review_names=False,
+                max_fps=0,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["fps"], 120.0)
+
     def test_merge_writes_single_videos_table_media_contract(self) -> None:
         with self.subTest("build"):
             import tempfile
@@ -351,7 +427,19 @@ class PretrainBuilderTest(unittest.TestCase):
                 self.assertEqual(manifest["meta"]["tasks_jsonl"], "meta/tasks.jsonl")
                 self.assertEqual(manifest["meta"]["episodes_jsonl"], "meta/episodes.jsonl")
                 self.assertEqual(manifest["meta"]["splits"], "meta/splits.json")
+                self.assertEqual(manifest["meta"]["sessions"], "meta/sessions.json")
+                self.assertEqual(
+                    manifest["reader_hints"]["fragment_strategy"]["data/videos.lance"][
+                        "max_bytes_per_file"
+                    ],
+                    4 * 1024 * 1024 * 1024,
+                )
                 self.assertNotIn("stats", manifest)
+                self.assertNotIn("primary_access_patterns", manifest)
+                self.assertNotIn("provenance", manifest)
+                self.assertNotIn("sources", manifest["meta"])
+                self.assertFalse((out / "meta" / "manifest.json").exists())
+                self.assertFalse((out / "meta" / "sources.json").exists())
                 self.assertNotIn("tasks", manifest)
                 for forbidden in (
                     "state_column",
@@ -421,6 +509,10 @@ class PretrainBuilderTest(unittest.TestCase):
                 self.assertTrue((out / "meta" / "splits.json").exists())
                 task = json.loads((out / "meta" / "tasks.jsonl").read_text().splitlines()[0])
                 self.assertEqual(task["language_instruction"], "pick")
+                readme = (out / "README.md").read_text(encoding="utf-8")
+                self.assertTrue(readme.startswith("---\n"))
+                self.assertIn("task_categories:\n- robotics\n", readme)
+                self.assertIn("size_categories:\n- n<1K\n", readme)
 
 
 def _read_blob(ds: object, column: str, index: int = 0) -> bytes:

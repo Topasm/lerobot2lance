@@ -37,9 +37,12 @@ from typing import Any
 PUBLISHED_FORMAT = "rllab_published_lance_dataset_v2"
 PUBLISHED_LAYOUT = "rllab_published_dataset_v2"
 DEFAULT_DATASET_ID = "rllab-postech/pretraining-aiworker-bg2-19d"
+DEFAULT_MAX_FPS = 30.0
 LANCE_DATA_STORAGE_VERSION = "2.2"
 LANCE_BLOB_ENCODING = "lance.blob.v2"
 PUBLISHED_BLOB_POLICY = "inline_bytes_only"
+COMPACT_MAX_BYTES_PER_FILE = 4 * 1024 * 1024 * 1024
+COMPACT_NUM_THREADS = 8
 STATE_DIM = 19
 ACTION_DIM = 19
 SCALAR_INDEXES: dict[str, list[tuple[str, str]]] = {
@@ -84,12 +87,48 @@ def main() -> int:
         action="store_true",
         help="Include source repos whose names look like TEST/upload scratch data.",
     )
+    parser.add_argument(
+        "--max-fps",
+        type=float,
+        default=DEFAULT_MAX_FPS,
+        help=(
+            "Exclude sources above this FPS. Use 0 or a negative value to disable. "
+            f"Default: {DEFAULT_MAX_FPS}."
+        ),
+    )
     parser.add_argument("--limit-sources", type=int, default=None)
     parser.add_argument(
         "--batch-size",
         type=int,
         default=8,
         help="Rows per write batch.",
+    )
+    parser.add_argument(
+        "--no-compact",
+        dest="compact",
+        action="store_false",
+        help="Skip final Lance compaction. By default the builder compacts tables.",
+    )
+    parser.set_defaults(compact=True)
+    parser.add_argument(
+        "--compact-max-bytes",
+        type=int,
+        default=COMPACT_MAX_BYTES_PER_FILE,
+        help=(
+            "Target maximum bytes per compacted Lance data file. "
+            f"Default: {COMPACT_MAX_BYTES_PER_FILE} (4 GiB)."
+        ),
+    )
+    parser.add_argument(
+        "--compact-num-threads",
+        type=int,
+        default=COMPACT_NUM_THREADS,
+        help=f"Threads for final Lance compaction. Default: {COMPACT_NUM_THREADS}.",
+    )
+    parser.add_argument(
+        "--keep-old-versions",
+        action="store_true",
+        help="Keep pre-compaction Lance versions instead of cleaning old versions.",
     )
     args = parser.parse_args()
 
@@ -102,6 +141,7 @@ def main() -> int:
         converted_root,
         strict_bg2_only=args.strict_bg2_only,
         include_review_names=args.include_review_names,
+        max_fps=args.max_fps,
     )
     if args.limit_sources is not None:
         sources = sources[: args.limit_sources]
@@ -210,7 +250,7 @@ def main() -> int:
         session = {
             "source_id": source_id,
             "source_dataset": source["source_repo_id"],
-            "source_url": hf_dataset_url(source["source_repo_id"]),
+            "source_url": source.get("source_url") or hf_dataset_url(source["source_repo_id"]),
             "local_path": str(bundle),
             "robot_type": source.get("robot_type"),
             "robot_name": source.get("robot_name"),
@@ -237,6 +277,19 @@ def main() -> int:
         frame_offset += local_frame_count
         video_count += local_video_count
 
+    if args.compact:
+        compact_lance_tables(
+            lance,
+            output,
+            max_bytes_per_file=args.compact_max_bytes,
+            num_threads=args.compact_num_threads,
+            blob_write_target_bytes=args.compact_max_bytes,
+        )
+
+    indexes_created = create_scalar_indexes(lance, output)
+    if args.compact and not args.keep_old_versions:
+        cleanup_lance_tables(lance, output)
+
     manifest = build_manifest(
         dataset_id=args.dataset_id,
         sources=sources,
@@ -247,12 +300,11 @@ def main() -> int:
         episodes=episode_offset,
         frames=frame_offset,
         videos=video_count,
-        indexes_created=create_scalar_indexes(lance, output),
+        indexes_created=indexes_created,
+        compact_max_bytes=args.compact_max_bytes if args.compact else None,
     )
     write_json(output / "manifest.json", manifest)
-    write_json(output / "meta" / "manifest.json", manifest)
     write_json(output / "meta" / "sessions.json", sessions)
-    write_json(output / "meta" / "sources.json", source_rows)
     write_json(output / "meta" / "info.json", build_info(args.dataset_id, manifest, source_rows))
     tasks_payload = build_tasks(output / "data" / "episodes.lance")
     stats_payload = compute_lerobot_stats(output / "data" / "train_episodes.lance")
@@ -284,6 +336,7 @@ def discover_sources(
     *,
     strict_bg2_only: bool,
     include_review_names: bool,
+    max_fps: float | None = DEFAULT_MAX_FPS,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for manifest_path in sorted(converted_root.glob("*/manifest.json")):
@@ -309,15 +362,24 @@ def discover_sources(
         )
         if strict_bg2_only and not is_bg2:
             continue
+        provenance = manifest.get("provenance") or {}
         repo_id = (
-            session.get("source_dataset")
-            or session.get("source_repo_id")
-            or info.get("repo_id")
+            provenance.get("source_repo_id")
             or manifest.get("source_repo_id")
+            or session.get("source_repo_id")
+            or session.get("source_dataset")
+            or info.get("repo_id")
             or manifest.get("dataset_id")
         )
-        quality = quality_flag(repo_id)
+        quality = (
+            provenance.get("quality_flag")
+            or manifest.get("quality_flag")
+            or quality_flag(repo_id)
+        )
         if quality != "ok" and not include_review_names:
+            continue
+        fps = as_float((manifest.get("rates") or {}).get("fps") or info.get("fps"))
+        if max_fps is not None and max_fps > 0 and fps is not None and fps > max_fps:
             continue
         if not (bundle / "data" / "episodes.lance").exists():
             continue
@@ -326,11 +388,12 @@ def discover_sources(
                 "path": str(bundle),
                 "dataset_id": manifest.get("dataset_id") or bundle.name,
                 "source_repo_id": repo_id,
+                "source_url": provenance.get("source_dataset_url") or hf_dataset_url(repo_id),
                 "robot_type": robot_type,
                 "robot_name": robot_name,
                 "pretrain_tier": pretrain_tier,
                 "quality_flag": quality,
-                "fps": (manifest.get("rates") or {}).get("fps") or info.get("fps"),
+                "fps": fps,
                 "episodes": int((manifest.get("counts") or {}).get("episodes") or 0),
                 "frames": int((manifest.get("counts") or {}).get("frames") or 0),
                 "videos": int((manifest.get("counts") or {}).get("videos") or 0),
@@ -677,6 +740,207 @@ def create_scalar_indexes(lance: Any, output: Path) -> list[dict[str, Any]]:
     return created
 
 
+def compact_lance_tables(
+    lance: Any,
+    output: Path,
+    *,
+    max_bytes_per_file: int,
+    num_threads: int,
+    blob_write_target_bytes: int,
+) -> None:
+    _ = num_threads
+    for name in ("episodes", "train_episodes", "frames"):
+        path = output / "data" / f"{name}.lance"
+        if not path.exists():
+            continue
+        rewrite_table_compacted(
+            lance,
+            path,
+            max_bytes_per_file=max_bytes_per_file,
+            batch_size=100_000,
+        )
+    videos_path = output / "data" / "videos.lance"
+    if videos_path.exists():
+        rewrite_blob_table_compacted(
+            lance,
+            videos_path,
+            max_bytes_per_file=max_bytes_per_file,
+            target_blob_bytes=blob_write_target_bytes,
+        )
+
+
+def rewrite_table_compacted(
+    lance: Any,
+    path: Path,
+    *,
+    max_bytes_per_file: int,
+    batch_size: int,
+) -> None:
+    import pyarrow as pa
+
+    ds = lance.dataset(str(path))
+    schema = ds.schema
+    tmp_path = path.with_name(f"{path.name}.compact_tmp")
+    backup_path = path.with_name(f"{path.name}.precompact_backup")
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+    if backup_path.exists():
+        shutil.rmtree(backup_path)
+
+    mode = "overwrite"
+    total_rows = 0
+    writes = 0
+    pending_batches: list[Any] = []
+    pending_bytes = 0
+
+    def flush_batches() -> None:
+        nonlocal pending_batches, pending_bytes, mode, total_rows, writes
+        if not pending_batches:
+            return
+        table = pa.Table.from_batches(pending_batches, schema=schema)
+        if table.num_rows == 0:
+            pending_batches = []
+            pending_bytes = 0
+            return
+        lance.write_dataset(
+            table,
+            str(tmp_path),
+            mode=mode,
+            data_storage_version=LANCE_DATA_STORAGE_VERSION,
+            max_bytes_per_file=max_bytes_per_file,
+        )
+        mode = "append"
+        total_rows += table.num_rows
+        writes += 1
+        print(
+            f"rewrote {path.name} compact write {writes}: "
+            f"rows={table.num_rows} bytes={pending_bytes}",
+            flush=True,
+        )
+        pending_batches = []
+        pending_bytes = 0
+
+    for batch in scan_batches(ds, batch_size=batch_size):
+        if batch.num_rows == 0:
+            continue
+        pending_batches.append(batch)
+        pending_bytes += int(getattr(batch, "nbytes", 0) or 0)
+        if pending_bytes >= max_bytes_per_file:
+            flush_batches()
+    flush_batches()
+
+    if total_rows:
+        assert_lance_storage_version(lance, tmp_path)
+        path.rename(backup_path)
+        tmp_path.rename(path)
+        shutil.rmtree(backup_path)
+    else:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+    print(f"rewrote {path}: rows={total_rows} batches={writes}", flush=True)
+
+
+def rewrite_blob_table_compacted(
+    lance: Any,
+    path: Path,
+    *,
+    max_bytes_per_file: int,
+    target_blob_bytes: int,
+) -> None:
+    import pyarrow as pa
+
+    ds = lance.dataset(str(path))
+    schema = ds.schema
+    blob_columns = {field.name for field in schema if is_blob_field(field)}
+    if not blob_columns:
+        return
+
+    tmp_path = path.with_name(f"{path.name}.compact_tmp")
+    backup_path = path.with_name(f"{path.name}.precompact_backup")
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+    if backup_path.exists():
+        shutil.rmtree(backup_path)
+
+    source_columns = set(schema.names)
+    rows: list[dict[str, Any]] = []
+    batch_blob_bytes = 0
+    mode = "overwrite"
+    total_rows = 0
+    writes = 0
+
+    def flush_rows() -> None:
+        nonlocal rows, batch_blob_bytes, mode, writes
+        if not rows:
+            return
+        table = table_from_pylist_with_blob_columns(
+            pa,
+            lance,
+            rows,
+            schema=schema,
+            blob_columns=blob_columns,
+        )
+        lance.write_dataset(
+            table,
+            str(tmp_path),
+            mode=mode,
+            data_storage_version=LANCE_DATA_STORAGE_VERSION,
+            max_bytes_per_file=max_bytes_per_file,
+        )
+        mode = "append"
+        writes += 1
+        print(
+            f"rewrote {path.name} compact batch {writes}: "
+            f"rows={len(rows)} blob_bytes={batch_blob_bytes}",
+            flush=True,
+        )
+        rows = []
+        batch_blob_bytes = 0
+
+    for batch in scan_batches(ds, batch_size=256):
+        for row in batch.to_pylist():
+            source_row_index = total_rows
+            out = dict(row)
+            materialize_blobs(ds, out, source_columns, blob_columns, source_row_index)
+            row_blob_bytes = sum(
+                len(value)
+                for column in blob_columns
+                for value in [out.get(column)]
+                if isinstance(value, (bytes, bytearray, memoryview))
+            )
+            if rows and batch_blob_bytes + row_blob_bytes > target_blob_bytes:
+                flush_rows()
+            rows.append(out)
+            batch_blob_bytes += row_blob_bytes
+            total_rows += 1
+    flush_rows()
+
+    if total_rows:
+        assert_lance_storage_version(lance, tmp_path)
+        path.rename(backup_path)
+        tmp_path.rename(path)
+        shutil.rmtree(backup_path)
+    else:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+    print(f"rewrote {path}: rows={total_rows} batches={writes}", flush=True)
+
+
+def cleanup_lance_tables(lance: Any, output: Path) -> None:
+    for name in ("episodes", "train_episodes", "frames", "videos"):
+        path = output / "data" / f"{name}.lance"
+        if path.exists():
+            cleanup_lance_table(lance, path)
+
+
+def cleanup_lance_table(lance: Any, path: Path) -> None:
+    ds = lance.dataset(str(path))
+    stats = ds.cleanup_old_versions(
+        retain_versions=1,
+        delete_unverified=True,
+        error_if_tagged_old_versions=False,
+    )
+    print(f"cleaned old versions {path}: {stats}", flush=True)
+
+
 def clear_blobs(row: dict[str, Any], blob_columns: set[str]) -> None:
     for column in blob_columns:
         row[column] = None
@@ -750,7 +1014,7 @@ def transform_episode_metadata(
         "source_id": source_id,
         "source_dataset": source.get("source_repo_id"),
         "source_repo_id": source.get("source_repo_id"),
-        "source_dataset_url": hf_dataset_url(source.get("source_repo_id")),
+        "source_dataset_url": source.get("source_url") or hf_dataset_url(source.get("source_repo_id")),
         "source_local_path": source.get("path"),
         "source_episode_index": source_episode,
         "session_id": row.get("session_id") or source.get("source_repo_id"),
@@ -795,7 +1059,7 @@ def transform_train_episode(
         "source_id": source_id,
         "source_dataset": source.get("source_repo_id"),
         "source_repo_id": source.get("source_repo_id"),
-        "source_dataset_url": hf_dataset_url(source.get("source_repo_id")),
+        "source_dataset_url": source.get("source_url") or hf_dataset_url(source.get("source_repo_id")),
         "source_local_path": source.get("path"),
         "source_episode_index": source_episode,
         "session_id": row.get("session_id") or source.get("source_repo_id"),
@@ -830,7 +1094,7 @@ def transform_frame(
         "source_id": source_id,
         "source_dataset": source.get("source_repo_id"),
         "source_repo_id": source.get("source_repo_id"),
-        "source_dataset_url": hf_dataset_url(source.get("source_repo_id")),
+        "source_dataset_url": source.get("source_url") or hf_dataset_url(source.get("source_repo_id")),
         "source_local_path": source.get("path"),
         "source_episode_index": source_episode,
         "session_id": row.get("session_id") or source.get("source_repo_id"),
@@ -985,7 +1249,7 @@ def transform_video(
         "source": {
             "uri": source_struct.get("uri") or row.get("source_uri") or row.get("uri"),
             "repo_id": source.get("source_repo_id"),
-            "dataset_url": hf_dataset_url(source.get("source_repo_id")),
+            "dataset_url": source.get("source_url") or hf_dataset_url(source.get("source_repo_id")),
             "media_id": row.get("media_id"),
             "relative_path": row.get("source_relative_path") or row.get("relative_path"),
         },
@@ -1007,7 +1271,7 @@ def transform_video(
         "source_id": source_id,
         "source_dataset": source.get("source_repo_id"),
         "source_repo_id": source.get("source_repo_id"),
-        "source_dataset_url": hf_dataset_url(source.get("source_repo_id")),
+        "source_dataset_url": source.get("source_url") or hf_dataset_url(source.get("source_repo_id")),
         "source_local_path": source.get("path"),
         "source_episode_index": source_episode,
         "session_id": row.get("session_id") or source.get("source_repo_id"),
@@ -1202,6 +1466,7 @@ def build_manifest(
     frames: int,
     videos: int,
     indexes_created: list[dict[str, Any]],
+    compact_max_bytes: int | None,
 ) -> dict[str, Any]:
     fps_values = sorted({float(source["fps"]) for source in sources if source.get("fps") is not None})
     primary_fps = 10.0 if 10.0 in fps_values else (fps_values[0] if fps_values else None)
@@ -1289,6 +1554,14 @@ def build_manifest(
                     "byte_size",
                 ],
             },
+            "fragment_strategy": {
+                "data/episodes.lance": {"max_bytes_per_file": compact_max_bytes},
+                "data/train_episodes.lance": {"max_bytes_per_file": compact_max_bytes},
+                "data/frames.lance": {"max_bytes_per_file": compact_max_bytes},
+                "data/videos.lance": {"max_bytes_per_file": compact_max_bytes},
+            }
+            if compact_max_bytes
+            else {},
         },
         "indexes": {
             "created": indexes_created,
@@ -1315,23 +1588,6 @@ def build_manifest(
                 },
             ],
         },
-        "primary_access_patterns": {
-            "episode_sequence_loading": {
-                "table": "train_episodes",
-                "path": "data/train_episodes.lance",
-            },
-            "random_frame_sampling": {
-                "table": "frames",
-                "path": "data/frames.lance",
-                "index_column": "global_frame_index",
-            },
-            "video_blob_lookup": {
-                "table": "videos",
-                "path": "data/videos.lance",
-                "lookup_key": "media_id",
-                "blob_column": "video_blob",
-            },
-        },
         "tables": {
             "episodes": {"path": "data/episodes.lance", "exists": True},
             "train_episodes": {"path": "data/train_episodes.lance", "exists": True},
@@ -1348,33 +1604,12 @@ def build_manifest(
             "episodes_jsonl": "meta/episodes.jsonl",
             "splits": "meta/splits.json",
             "sessions": "meta/sessions.json",
-            "sources": "meta/sources.json",
         },
         "counts": {
             "episodes": episodes,
             "frames": frames,
             "videos": videos,
             "sources": len(sources),
-        },
-        "provenance": {
-            "sessions": "meta/sessions.json",
-            "sources": "meta/sources.json",
-            "source_columns": [
-                "source_id",
-                "source_dataset",
-                "source_repo_id",
-                "source_dataset_url",
-                "source_episode_index",
-                "source_robot_type",
-                "pretrain_tier",
-            ],
-            "media_reference_columns": [
-                "source_uri",
-                "source_local_path",
-                "source_video_table",
-                "source_media_id",
-                "source_relative_path",
-            ],
         },
     }
 
@@ -1493,6 +1728,23 @@ def build_info(dataset_id: str, manifest: dict[str, Any], sources: list[dict[str
 
 def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict[str, Any]]) -> str:
     lines = [
+        "---",
+        f'pretty_name: "{dataset_id}"',
+        "license: other",
+        "task_categories:",
+        "- robotics",
+        "size_categories:",
+        f"- {dataset_size_category((manifest.get('counts') or {}).get('frames') or 0)}",
+        "tags:",
+        "- robotics",
+        "- robot-learning",
+        "- imitation-learning",
+        "- lerobot",
+        "- lance",
+        "- video",
+        "- rllab",
+        "---",
+        "",
         f"# {dataset_id}",
         "",
         "Merged 19D AI Worker/BG2 pretraining dataset in RLLAB published Lance layout.",
@@ -1558,6 +1810,23 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
         ]
     )
     return "\n".join(lines)
+
+
+def dataset_size_category(num_examples: Any) -> str:
+    count = int(num_examples or 0)
+    if count < 1_000:
+        return "n<1K"
+    if count < 10_000:
+        return "1K<n<10K"
+    if count < 100_000:
+        return "10K<n<100K"
+    if count < 1_000_000:
+        return "100K<n<1M"
+    if count < 10_000_000:
+        return "1M<n<10M"
+    if count < 100_000_000:
+        return "10M<n<100M"
+    return "n>100M"
 
 
 def write_json(path: Path, payload: Any) -> None:

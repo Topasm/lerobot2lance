@@ -14,13 +14,15 @@ from typing import Any
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--converted", default="data/converted_19d")
-    parser.add_argument("--status", default="data/index/convert_19d_status.jsonl")
-    parser.add_argument("--index", default="data/index/hf_robotis_19d.json")
+    parser.add_argument("--rejected", default="data/rejected_converted_19d")
+    parser.add_argument("--status", default="data/index/convert_raw_19d_status.jsonl")
+    parser.add_argument("--index", default="data/index/raw_19d_validation.json")
     parser.add_argument("--json-out", default="data/index/converted_19d_sources.json")
     parser.add_argument("--readme-out", default="data/converted_19d/README.md")
     args = parser.parse_args()
 
     converted_root = Path(args.converted)
+    rejected_root = Path(args.rejected)
     status_path = Path(args.status)
     index_path = Path(args.index)
     json_out = Path(args.json_out)
@@ -30,7 +32,10 @@ def main() -> int:
     status_rows = load_jsonl(status_path)
     status_by_repo = latest_status_by_repo(status_rows)
     converted_rows = load_converted_manifests(converted_root, status_by_repo, index_rows)
-    failed_rows = load_failed_rows(status_by_repo, converted_rows)
+    converted_repos = {str(row.get("source_repo_id")) for row in converted_rows}
+    failed_rows = load_failed_rows(status_by_repo, converted_rows, index_rows)
+    failed_rows.extend(load_rejected_manifests(rejected_root, index_rows, converted_repos))
+    failed_rows.sort(key=lambda row: (str(row.get("source_repo_id")), str(row.get("status"))))
 
     summary = build_summary(converted_rows, failed_rows)
     payload = {
@@ -54,7 +59,8 @@ def main() -> int:
 def load_index(path: Path) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
-    rows = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("datasets") if isinstance(payload, dict) else payload
     return {str(row.get("repo_id")): row for row in rows if row.get("repo_id")}
 
 
@@ -85,10 +91,12 @@ def load_converted_manifests(
     rows: list[dict[str, Any]] = []
     for manifest_path in sorted(converted_root.glob("*/manifest.json")):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        provenance = manifest.get("provenance") or {}
         session = first_session(manifest_path.parent)
         info = read_json_if_exists(manifest_path.parent / "meta" / "info.json")
         repo_id = (
-            session.get("source_dataset")
+            provenance.get("source_repo_id")
+            or session.get("source_dataset")
             or session.get("source_repo_id")
             or info.get("repo_id")
             or manifest.get("source_repo_id")
@@ -100,25 +108,25 @@ def load_converted_manifests(
         report = status.get("report", {})
         cameras = registry_cameras(manifest) or manifest.get("camera_keys") or report.get("cameras") or []
         counts = manifest.get("counts") or {}
-        frames = counts.get("frames") or manifest.get("total_frames") or report.get("frames_written")
-        episodes = counts.get("episodes") or manifest.get("total_episodes") or report.get("episodes_written")
-        media = (
-            counts.get("videos")
-            or counts.get("media")
-            or manifest.get("total_video_segments")
-            or manifest.get("total_videos")
-            or report.get("media_written")
+        frames = first_present(counts.get("frames"), manifest.get("total_frames"), report.get("frames_written"))
+        episodes = first_present(counts.get("episodes"), manifest.get("total_episodes"), report.get("episodes_written"))
+        media = first_present(
+            counts.get("videos"),
+            counts.get("media"),
+            manifest.get("total_video_segments"),
+            manifest.get("total_videos"),
+            report.get("media_written"),
         )
         fps = (manifest.get("rates") or {}).get("fps") or manifest.get("fps") or report.get("fps") or index_row.get("fps")
         row = {
             "dataset_id": manifest.get("dataset_id") or manifest_path.parent.name,
             "local_path": str(manifest_path.parent),
             "source_repo_id": repo_id,
-            "source_url": hf_dataset_url(repo_id),
+            "source_url": provenance.get("source_dataset_url") or hf_dataset_url(repo_id),
             "status": "converted",
-            "robot_type": info.get("robot_type") or manifest.get("source_robot_type") or index_row.get("robot_type") or status.get("robot_type"),
-            "robot_name": info.get("robot_name") or manifest.get("source_robot_name") or index_row.get("robot_name"),
-            "pretrain_tier": manifest.get("pretrain_tier"),
+            "robot_type": info.get("robot_type") or provenance.get("source_robot_type") or manifest.get("source_robot_type") or index_row.get("robot_type") or status.get("robot_type"),
+            "robot_name": info.get("robot_name") or provenance.get("source_robot_name") or manifest.get("source_robot_name") or index_row.get("robot_name"),
+            "pretrain_tier": provenance.get("pretrain_tier") or manifest.get("pretrain_tier"),
             "episodes": as_int(episodes),
             "frames": as_int(frames),
             "media": as_int(media),
@@ -126,7 +134,7 @@ def load_converted_manifests(
             "action_dim": registry_dim(manifest, "actions", "action.body") or manifest.get("action_dim") or index_row.get("action_dim"),
             "state_dim": registry_dim(manifest, "modalities", "state.body") or manifest.get("state_dim") or index_row.get("state_dim"),
             "cameras": cameras,
-            "quality_flag": quality_flag(repo_id),
+            "quality_flag": provenance.get("quality_flag") or index_row.get("quality_flag") or quality_flag(repo_id),
         }
         rows.append(row)
     rows.sort(key=lambda row: (str(row.get("source_repo_id")), str(row.get("dataset_id"))))
@@ -181,11 +189,30 @@ def registry_dim(manifest: dict[str, Any], section: str, name: str) -> int | Non
 def load_failed_rows(
     status_by_repo: dict[str, dict[str, Any]],
     converted_rows: list[dict[str, Any]],
+    index_rows: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     converted_repos = {str(row.get("source_repo_id")) for row in converted_rows}
     rows = []
+    for repo_id, index_row in sorted(index_rows.items()):
+        if repo_id in converted_repos:
+            continue
+        if index_row.get("ok") is not False:
+            continue
+        rows.append(
+            {
+                "source_repo_id": repo_id,
+                "source_url": index_row.get("source_url") or hf_dataset_url(repo_id),
+                "status": index_row.get("status") or "bad_raw",
+                "robot_type": index_row.get("robot_type"),
+                "frames": index_row.get("indexed_frames") or index_row.get("info_total_frames"),
+                "error": "; ".join(str(item) for item in (index_row.get("errors") or [])),
+                "quality_flag": index_row.get("quality_flag") or quality_flag(repo_id),
+            }
+        )
     for repo_id, status in sorted(status_by_repo.items()):
         if repo_id in converted_repos:
+            continue
+        if any(row.get("source_repo_id") == repo_id for row in rows):
             continue
         if status.get("status") not in {"error", "locked"}:
             continue
@@ -198,6 +225,41 @@ def load_failed_rows(
                 "frames": status.get("total_frames"),
                 "error": status.get("error"),
                 "quality_flag": quality_flag(repo_id),
+            }
+        )
+    return rows
+
+
+def load_rejected_manifests(
+    rejected_root: Path,
+    index_rows: dict[str, dict[str, Any]],
+    converted_repos: set[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not rejected_root.exists():
+        return rows
+    for manifest_path in sorted(rejected_root.glob("*/manifest.json")):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        provenance = manifest.get("provenance") or {}
+        repo_id = (
+            provenance.get("source_repo_id")
+            or manifest.get("source_repo_id")
+            or manifest.get("source_dataset")
+            or manifest.get("dataset_id")
+        )
+        if str(repo_id) in converted_repos:
+            continue
+        index_row = index_rows.get(str(repo_id), {})
+        counts = manifest.get("counts") or {}
+        rows.append(
+            {
+                "source_repo_id": repo_id,
+                "source_url": provenance.get("source_dataset_url") or hf_dataset_url(repo_id),
+                "status": "rejected_after_publish_validation",
+                "robot_type": provenance.get("source_robot_type") or index_row.get("robot_type"),
+                "frames": counts.get("frames") or provenance.get("source_observed_frames") or index_row.get("indexed_frames"),
+                "error": "Converted bundle failed strict publish validation; excluded from data/converted_19d.",
+                "quality_flag": provenance.get("quality_flag") or index_row.get("quality_flag") or quality_flag(repo_id),
             }
         )
     return rows
@@ -229,7 +291,7 @@ def render_readme(payload: dict[str, Any]) -> str:
         f"Generated: `{payload['generated_at']}`",
         "",
         "This folder contains LeRobot datasets converted to the RLLAB published Lance layout.",
-        "Each converted bundle keeps its original Hugging Face dataset id in `manifest.json` as `source_repo_id`.",
+        "Each converted bundle keeps its original Hugging Face dataset id in `manifest.json#/provenance/source_repo_id`.",
         "",
         "## Summary",
         "",
@@ -356,6 +418,13 @@ def as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def quality_flag(repo_id: Any) -> str:
