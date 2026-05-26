@@ -37,7 +37,9 @@ from typing import Any
 PUBLISHED_FORMAT = "rllab_published_lance_dataset_v2"
 PUBLISHED_LAYOUT = "rllab_published_dataset_v2"
 DEFAULT_DATASET_ID = "rllab-postech/pretraining-aiworker-bg2-19d"
+DEFAULT_MIN_FPS = 5.0
 DEFAULT_MAX_FPS = 30.0
+DEFAULT_MIN_EPISODE_FRAMES = 30
 LANCE_DATA_STORAGE_VERSION = "2.2"
 LANCE_BLOB_ENCODING = "lance.blob.v2"
 PUBLISHED_BLOB_POLICY = "inline_bytes_only"
@@ -88,6 +90,15 @@ def main() -> int:
         help="Include source repos whose names look like TEST/upload scratch data.",
     )
     parser.add_argument(
+        "--min-fps",
+        type=float,
+        default=DEFAULT_MIN_FPS,
+        help=(
+            "Exclude sources/episodes below this FPS. Use 0 or a negative value to disable. "
+            f"Default: {DEFAULT_MIN_FPS}."
+        ),
+    )
+    parser.add_argument(
         "--max-fps",
         type=float,
         default=DEFAULT_MAX_FPS,
@@ -95,6 +106,21 @@ def main() -> int:
             "Exclude sources above this FPS. Use 0 or a negative value to disable. "
             f"Default: {DEFAULT_MAX_FPS}."
         ),
+    )
+    parser.add_argument(
+        "--min-episode-frames",
+        type=int,
+        default=DEFAULT_MIN_EPISODE_FRAMES,
+        help=(
+            "Exclude episodes shorter than this many frames. Use 0 or a negative value to disable. "
+            f"Default: {DEFAULT_MIN_EPISODE_FRAMES}."
+        ),
+    )
+    parser.add_argument(
+        "--max-episode-frames",
+        type=int,
+        default=0,
+        help="Exclude episodes longer than this many frames. Use 0 or a negative value to disable.",
     )
     parser.add_argument("--limit-sources", type=int, default=None)
     parser.add_argument(
@@ -141,6 +167,7 @@ def main() -> int:
         converted_root,
         strict_bg2_only=args.strict_bg2_only,
         include_review_names=args.include_review_names,
+        min_fps=args.min_fps,
         max_fps=args.max_fps,
     )
     if args.limit_sources is not None:
@@ -158,7 +185,48 @@ def main() -> int:
     import lance
     import pyarrow as pa
 
-    source_camera_keys, source_camera_columns = union_cameras(sources)
+    eligible_sources: list[dict[str, Any]] = []
+    prefilter_episode_offset = 0
+    for source_number, source in enumerate(sources, 1):
+        bundle = Path(source["path"])
+        episode_map = build_episode_map(
+            bundle / "data" / "episodes.lance",
+            prefilter_episode_offset,
+            min_episode_frames=args.min_episode_frames,
+            max_episode_frames=args.max_episode_frames,
+            min_fps=args.min_fps,
+            max_fps=args.max_fps,
+        )
+        source_episode_count = len(episode_map)
+        original_episode_count = int(source.get("episodes") or 0)
+        filtered_episode_count = max(0, original_episode_count - source_episode_count)
+        if not episode_map:
+            print(
+                f"[{source_number}/{len(sources)}] skip {source['source_repo_id']} "
+                f"all episodes filtered original_episodes={original_episode_count}",
+                flush=True,
+            )
+            continue
+        eligible_sources.append(
+            {
+                "source_number": source_number,
+                "source": source,
+                "episode_map": episode_map,
+                "source_episode_count": source_episode_count,
+                "original_episode_count": original_episode_count,
+                "filtered_episode_count": filtered_episode_count,
+            }
+        )
+        prefilter_episode_offset += source_episode_count
+    if not eligible_sources:
+        raise SystemExit(
+            "No episodes remained after quality filters. "
+            "Relax --min-episode-frames/--max-episode-frames/--min-fps/--max-fps."
+        )
+
+    source_camera_keys, source_camera_columns = union_cameras(
+        [item["source"] for item in eligible_sources]
+    )
     camera_keys = source_camera_keys
     camera_columns = source_camera_columns
     episodes_schema = build_episodes_schema(pa)
@@ -171,18 +239,26 @@ def main() -> int:
 
     sessions: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
+    included_sources: list[dict[str, Any]] = []
     episode_offset = 0
     frame_offset = 0
     video_count = 0
 
-    for source_id, source in enumerate(sources):
+    for item in eligible_sources:
+        source_number = int(item["source_number"])
+        source = item["source"]
+        bundle = Path(source["path"])
+        episode_map = item["episode_map"]
+        source_episode_count = int(item["source_episode_count"])
+        original_episode_count = int(item["original_episode_count"])
+        filtered_episode_count = int(item["filtered_episode_count"])
+        source_id = len(included_sources)
         print(
-            f"[{source_id + 1}/{len(sources)}] {source['source_repo_id']} "
-            f"episodes={source['episodes']} frames={source['frames']}",
+            f"[{source_number}/{len(sources)}] {source['source_repo_id']} "
+            f"episodes={source_episode_count}/{original_episode_count} "
+            f"filtered={filtered_episode_count} frames={source['frames']}",
             flush=True,
         )
-        bundle = Path(source["path"])
-        episode_map = build_episode_map(bundle / "data" / "episodes.lance", episode_offset)
         write_remapped_table(
             lance=lance,
             source_path=bundle / "data" / "episodes.lance",
@@ -260,6 +336,8 @@ def main() -> int:
             "episode_start": episode_offset,
             "episode_end": episode_offset + source_episode_count,
             "episodes": source_episode_count,
+            "source_episodes": original_episode_count,
+            "filtered_episodes": filtered_episode_count,
             "frames": local_frame_count,
             "videos": local_video_count,
         }
@@ -271,6 +349,16 @@ def main() -> int:
                 "action_dim": source.get("action_dim"),
                 "source_camera_keys": source.get("camera_keys") or [],
                 "source_camera_columns": source.get("camera_columns") or [],
+            }
+        )
+        included_sources.append(
+            {
+                **source,
+                "episodes": source_episode_count,
+                "frames": local_frame_count,
+                "videos": local_video_count,
+                "source_episodes": original_episode_count,
+                "filtered_episodes": filtered_episode_count,
             }
         )
         episode_offset += source_episode_count
@@ -292,7 +380,7 @@ def main() -> int:
 
     manifest = build_manifest(
         dataset_id=args.dataset_id,
-        sources=sources,
+        sources=included_sources,
         camera_keys=camera_keys,
         camera_columns=camera_columns,
         source_camera_keys=source_camera_keys,
@@ -302,6 +390,12 @@ def main() -> int:
         videos=video_count,
         indexes_created=indexes_created,
         compact_max_bytes=args.compact_max_bytes if args.compact else None,
+        quality_filters={
+            "min_fps": args.min_fps,
+            "max_fps": args.max_fps,
+            "min_episode_frames": args.min_episode_frames,
+            "max_episode_frames": args.max_episode_frames,
+        },
     )
     write_json(output / "manifest.json", manifest)
     write_json(output / "meta" / "sessions.json", sessions)
@@ -318,7 +412,8 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "datasets": len(sources),
+                "datasets": len(included_sources),
+                "discovered_datasets": len(sources),
                 "episodes": episode_offset,
                 "frames": frame_offset,
                 "videos": video_count,
@@ -336,6 +431,7 @@ def discover_sources(
     *,
     strict_bg2_only: bool,
     include_review_names: bool,
+    min_fps: float | None = DEFAULT_MIN_FPS,
     max_fps: float | None = DEFAULT_MAX_FPS,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -379,6 +475,8 @@ def discover_sources(
         if quality != "ok" and not include_review_names:
             continue
         fps = as_float((manifest.get("rates") or {}).get("fps") or info.get("fps"))
+        if min_fps is not None and min_fps > 0 and fps is not None and fps < min_fps:
+            continue
         if max_fps is not None and max_fps > 0 and fps is not None and fps > max_fps:
             continue
         if not (bundle / "data" / "episodes.lance").exists():
@@ -595,16 +693,76 @@ def split_for_episode(episode_index: int, episode_count: int) -> str:
     return "train" if episode_index < train_count else "val"
 
 
-def build_episode_map(episodes_path: Path, episode_offset: int) -> dict[int, int]:
+def build_episode_map(
+    episodes_path: Path,
+    episode_offset: int,
+    *,
+    min_episode_frames: int | None = DEFAULT_MIN_EPISODE_FRAMES,
+    max_episode_frames: int | None = 0,
+    min_fps: float | None = DEFAULT_MIN_FPS,
+    max_fps: float | None = DEFAULT_MAX_FPS,
+) -> dict[int, int]:
     import lance
 
     mapping: dict[int, int] = {}
     ds = lance.dataset(str(episodes_path))
-    for row in scan_rows(ds, columns=["episode_index"]):
+    columns = [name for name in ("episode_index", "length", "timestamps", "fps") if name in ds.schema.names]
+    for row in scan_rows(ds, columns=columns):
+        if not episode_passes_quality_filters(
+            row,
+            min_episode_frames=min_episode_frames,
+            max_episode_frames=max_episode_frames,
+            min_fps=min_fps,
+            max_fps=max_fps,
+        ):
+            continue
         source_episode = int(row["episode_index"])
         if source_episode not in mapping:
             mapping[source_episode] = episode_offset + len(mapping)
     return mapping
+
+
+def episode_passes_quality_filters(
+    row: dict[str, Any],
+    *,
+    min_episode_frames: int | None,
+    max_episode_frames: int | None,
+    min_fps: float | None,
+    max_fps: float | None,
+) -> bool:
+    return (
+        episode_filter_reason(
+            row,
+            min_episode_frames=min_episode_frames,
+            max_episode_frames=max_episode_frames,
+            min_fps=min_fps,
+            max_fps=max_fps,
+        )
+        is None
+    )
+
+
+def episode_filter_reason(
+    row: dict[str, Any],
+    *,
+    min_episode_frames: int | None,
+    max_episode_frames: int | None,
+    min_fps: float | None,
+    max_fps: float | None,
+) -> str | None:
+    length = as_int(row.get("length"))
+    if length is None:
+        length = len(row.get("timestamps") or [])
+    if min_episode_frames is not None and min_episode_frames > 0 and length < min_episode_frames:
+        return "short_episode"
+    if max_episode_frames is not None and max_episode_frames > 0 and length > max_episode_frames:
+        return "long_episode"
+    fps = as_float(row.get("fps"))
+    if min_fps is not None and min_fps > 0 and fps is not None and fps < min_fps:
+        return "low_fps"
+    if max_fps is not None and max_fps > 0 and fps is not None and fps > max_fps:
+        return "high_fps"
+    return None
 
 
 def write_remapped_table(
@@ -614,7 +772,7 @@ def write_remapped_table(
     target_path: Path,
     target_schema: Any,
     batch_size: int,
-    transform: Callable[[dict[str, Any]], dict[str, Any]],
+    transform: Callable[[dict[str, Any]], dict[str, Any] | None],
     global_frame_start: int | None = None,
     copy_blobs: bool = False,
 ) -> int:
@@ -623,22 +781,26 @@ def write_remapped_table(
     ds = lance.dataset(str(source_path))
     source_columns = set(ds.schema.names)
     blob_columns = {field.name for field in target_schema if is_blob_field(field)}
-    total_rows = 0
+    source_rows_seen = 0
+    rows_written = 0
     mode = "append" if target_path.exists() else "overwrite"
     for batch in scan_batches(ds, batch_size=batch_size):
         rows = []
         for row in batch.to_pylist():
-            source_row_index = total_rows
+            source_row_index = source_rows_seen
+            source_rows_seen += 1
             out = transform(row)
+            if out is None:
+                continue
             if global_frame_start is not None:
                 out["source_global_frame_index"] = as_int(row.get("global_frame_index"))
-                out["global_frame_index"] = global_frame_start + total_rows
+                out["global_frame_index"] = global_frame_start + rows_written
             if copy_blobs:
                 materialize_blobs(ds, out, source_columns, blob_columns, source_row_index)
             elif blob_columns:
                 clear_blobs(out, blob_columns)
             rows.append(out)
-            total_rows += 1
+            rows_written += 1
         if not rows:
             continue
         table = table_from_pylist_with_blob_columns(
@@ -655,9 +817,9 @@ def write_remapped_table(
             data_storage_version=LANCE_DATA_STORAGE_VERSION,
         )
         mode = "append"
-    if total_rows:
+    if rows_written:
         assert_lance_storage_version(lance, target_path)
-    return total_rows
+    return rows_written
 
 
 def assert_lance_storage_version(lance: Any, path: Path) -> None:
@@ -987,8 +1149,10 @@ def transform_episode_metadata(
     source_id: int,
     episode_map: dict[int, int],
     camera_columns: list[str],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     source_episode = int(row["episode_index"])
+    if source_episode not in episode_map:
+        return None
     episode_index = episode_map[source_episode]
     timestamps = row.get("timestamps") or []
     states = row.get("observation_state") or []
@@ -1032,8 +1196,10 @@ def transform_train_episode(
     source_id: int,
     episode_map: dict[int, int],
     camera_columns: list[str],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     source_episode = int(row["episode_index"])
+    if source_episode not in episode_map:
+        return None
     episode_index = episode_map[source_episode]
     timestamps = row.get("timestamps") or []
     states = row.get("observation_state") or []
@@ -1077,8 +1243,10 @@ def transform_frame(
     source: dict[str, Any],
     source_id: int,
     episode_map: dict[int, int],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     source_episode = int(row["episode_index"])
+    if source_episode not in episode_map:
+        return None
     return {
         "episode_index": episode_map[source_episode],
         "frame_index": as_int(row.get("frame_index")) or 0,
@@ -1236,8 +1404,10 @@ def transform_video(
     source: dict[str, Any],
     source_id: int,
     episode_map: dict[int, int],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     source_episode = int(row["episode_index"])
+    if source_episode not in episode_map:
+        return None
     episode_index = episode_map[source_episode]
     camera_id = row.get("camera_id") or ""
     source_struct = row.get("source") if isinstance(row.get("source"), dict) else {}
@@ -1467,6 +1637,7 @@ def build_manifest(
     videos: int,
     indexes_created: list[dict[str, Any]],
     compact_max_bytes: int | None,
+    quality_filters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fps_values = sorted({float(source["fps"]) for source in sources if source.get("fps") is not None})
     primary_fps = 10.0 if 10.0 in fps_values else (fps_values[0] if fps_values else None)
@@ -1485,6 +1656,7 @@ def build_manifest(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset_id": dataset_id,
         "source": "merged_converted_19d_lance_bundles",
+        "quality_filters": quality_filters or {},
         "primary_training_table": "data/train_episodes.lance",
         "state_action_alignment": {
             "type": "same_frame_timestamp",

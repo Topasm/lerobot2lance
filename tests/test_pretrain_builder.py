@@ -26,20 +26,22 @@ def _write_converted_19d_bundle(
     camera_key: str,
     camera_column: str,
     fps: float = 10.0,
+    length: int = 2,
 ) -> None:
     bundle = root / name
     (bundle / "data").mkdir(parents=True)
     (bundle / "meta").mkdir(parents=True)
 
-    states = [[float(frame)] * 19 for frame in range(2)]
-    actions = [[float(frame + 1)] * 19 for frame in range(2)]
+    states = [[float(frame)] * 19 for frame in range(length)]
+    actions = [[float(frame + 1)] * 19 for frame in range(length)]
+    timestamps = [float(frame) / fps for frame in range(length)]
     episode_rows = [
         {
             "episode_index": 0,
             "task_index": 0,
             "fps": fps,
-            "length": 2,
-            "timestamps": [0.0, 1.0 / fps],
+            "length": length,
+            "timestamps": timestamps,
             "observation_state": states,
             "actions": actions,
             "language_instruction": "pick",
@@ -49,9 +51,9 @@ def _write_converted_19d_bundle(
                     "camera_column": camera_column,
                     "media_id": f"episode_00000000_{camera_column}",
                     "from_timestamp": 0.0,
-                    "to_timestamp": 1.0 / fps,
+                    "to_timestamp": (length - 1) / fps if length else 0.0,
                     "frame_start": 0,
-                    "frame_count": 2,
+                    "frame_count": length,
                 }
             ],
             "task_segments": [
@@ -59,12 +61,12 @@ def _write_converted_19d_bundle(
                     "task_index": 0,
                     "language_instruction": "pick",
                     "start_frame": 0,
-                    "end_frame_exclusive": 2,
+                    "end_frame_exclusive": length,
                     "start_timestamp": 0.0,
-                    "end_timestamp_exclusive": 2.0 / fps,
+                    "end_timestamp_exclusive": length / fps,
                 }
             ],
-            "trajectory_sha256": _trajectory_sha256([0.0, 1.0 / fps], states, actions),
+            "trajectory_sha256": _trajectory_sha256(timestamps, states, actions),
             "split": "train",
             "source_dataset": repo_id,
             "source_episode_index": 0,
@@ -89,7 +91,7 @@ def _write_converted_19d_bundle(
             "session_id": repo_id,
             "embodiment_id": "ffw_bg2_rev4",
         }
-        for frame in range(2)
+        for frame in range(length)
     ]
     video_rows = [
         {
@@ -115,8 +117,8 @@ def _write_converted_19d_bundle(
             "relative_path": "videos/episode_000000.mp4",
             "video_blob": b"abc",
             "from_timestamp": 0.0,
-            "to_timestamp": 1.0 / fps,
-            "num_frames": 2,
+            "to_timestamp": (length - 1) / fps if length else 0.0,
+            "num_frames": length,
             "chunk_index": 0,
             "file_index": 0,
             "sha256": "abc",
@@ -272,7 +274,7 @@ def _write_converted_19d_bundle(
         },
         "actions": {"action.body": {"kind": "action", "shape": [19], "shape_policy": "single"}},
         "rates": {"fps": fps},
-        "counts": {"episodes": 1, "frames": 2, "videos": 1},
+        "counts": {"episodes": 1, "frames": length, "videos": 1},
         "tables": {
             "episodes": "data/episodes.lance",
             "frames": "data/frames.lance",
@@ -370,6 +372,87 @@ class PretrainBuilderTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["fps"], 120.0)
 
+    def test_discover_sources_excludes_low_fps_by_default(self) -> None:
+        import tempfile
+
+        from scripts.build_pretrain_19d_lance import discover_sources
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            converted = tmp / "converted_19d"
+            _write_converted_19d_bundle(
+                converted,
+                name="slow",
+                repo_id="Org/Slow",
+                camera_key="observation.images.cam_head",
+                camera_column="observation_images_cam_head",
+                fps=1.0,
+            )
+
+            rows = discover_sources(
+                converted,
+                strict_bg2_only=False,
+                include_review_names=False,
+            )
+            self.assertEqual(rows, [])
+
+            rows = discover_sources(
+                converted,
+                strict_bg2_only=False,
+                include_review_names=False,
+                min_fps=0,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["fps"], 1.0)
+
+    def test_merge_filters_short_episodes_by_default(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            converted = tmp / "converted_19d"
+            _write_converted_19d_bundle(
+                converted,
+                name="short",
+                repo_id="Org/Short",
+                camera_key="observation.images.cam_head",
+                camera_column="observation_images_cam_head",
+                length=2,
+            )
+            _write_converted_19d_bundle(
+                converted,
+                name="long_enough",
+                repo_id="Org/LongEnough",
+                camera_key="observation.images.cam_head",
+                camera_column="observation_images_cam_head",
+                length=30,
+            )
+            out = tmp / "pretrain"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/build_pretrain_19d_lance.py",
+                    "--converted-root",
+                    str(converted),
+                    "--output",
+                    str(out),
+                    "--no-compact",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).resolve().parents[1],
+            )
+
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["counts"]["episodes"], 1)
+            self.assertEqual(manifest["counts"]["frames"], 30)
+            self.assertEqual(manifest["counts"]["videos"], 1)
+            self.assertEqual(manifest["quality_filters"]["min_episode_frames"], 30)
+            sessions = json.loads((out / "meta" / "sessions.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0]["source_dataset"], "Org/LongEnough")
+
     def test_merge_writes_single_videos_table_media_contract(self) -> None:
         with self.subTest("build"):
             import tempfile
@@ -400,6 +483,8 @@ class PretrainBuilderTest(unittest.TestCase):
                         str(converted),
                         "--output",
                         str(out),
+                        "--min-episode-frames",
+                        "0",
                     ],
                     check=True,
                     capture_output=True,
