@@ -1941,18 +1941,42 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
         f"- Format: {manifest['format']} / schema {manifest['schema_version']}",
         f"- Blob storage: {manifest['lance']['blob_encoding']} ({manifest['lance']['published_blob_policy']})",
         "",
-        "Each Lance row",
-        "carries provenance columns such as `source_dataset`, `source_repo_id`,",
-        "`source_dataset_url`, `source_local_path`, `source_episode_index`,",
-        "`source_robot_type`, and `pretrain_tier`. `data/videos.lance` also keeps",
-        "`source_video_table`, `source_media_id`, and `source_relative_path` while",
-        "storing the canonical copied MP4 blob used by viewers and training.",
-        "",
-        "## Sources",
-        "",
-        "| Source dataset | Robot type | Tier | Episodes | Frames | Videos | FPS | Quality |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
+    quality_filters = manifest.get("quality_filters") or {}
+    if quality_filters:
+        filtered_reasons = quality_filters.get("filtered_reasons") or {}
+        lines.extend(
+            [
+                "## Quality Filters",
+                "",
+                f"- Min FPS: {quality_filters.get('min_fps')}",
+                f"- Max FPS: {quality_filters.get('max_fps')}",
+                f"- Min episode frames: {quality_filters.get('min_episode_frames')}",
+                f"- Max episode frames: {quality_filters.get('max_episode_frames') or 'disabled'}",
+                "- Filtered episodes: "
+                + (
+                    ", ".join(f"{reason}={count}" for reason, count in sorted(filtered_reasons.items()))
+                    if filtered_reasons
+                    else "0"
+                ),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Each Lance row",
+            "carries provenance columns such as `source_dataset`, `source_repo_id`,",
+            "`source_dataset_url`, `source_local_path`, `source_episode_index`,",
+            "`source_robot_type`, and `pretrain_tier`. `data/videos.lance` also keeps",
+            "`source_video_table`, `source_media_id`, and `source_relative_path` while",
+            "storing the canonical copied MP4 blob used by viewers and training.",
+            "",
+            "## Sources",
+            "",
+            "| Source dataset | Robot type | Tier | Episodes | Frames | Videos | FPS | Quality |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
     for row in sessions:
         lines.append(
             "| "
