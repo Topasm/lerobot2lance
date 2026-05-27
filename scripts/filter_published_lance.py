@@ -81,6 +81,12 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--require-any-camera-keys",
+        nargs="*",
+        default=[],
+        help="Exclude episodes that have none of these camera keys.",
+    )
+    parser.add_argument(
         "--keep-camera-keys",
         nargs="*",
         default=[],
@@ -88,6 +94,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     required_camera_keys = sorted({normalize_camera_key(key) for key in args.required_camera_keys})
+    require_any_camera_keys = sorted({normalize_camera_key(key) for key in args.require_any_camera_keys})
     keep_camera_keys = sorted({normalize_camera_key(key) for key in args.keep_camera_keys})
 
     source = args.source.resolve()
@@ -118,6 +125,7 @@ def main() -> int:
         max_fps=args.max_fps,
         drop_wrist_only=args.drop_wrist_only,
         required_camera_keys=required_camera_keys,
+        require_any_camera_keys=require_any_camera_keys,
     )
     if not episode_map:
         raise SystemExit("No episodes remained after filters.")
@@ -167,6 +175,7 @@ def main() -> int:
         keep_camera_keys=keep_camera_keys,
     )
     fps_values = read_fps_values(lance.dataset(str(output / "data" / "episodes.lance")))
+    video_camera_keys = read_video_camera_keys(lance.dataset(str(output / "data" / "videos.lance")))
 
     indexes_created = create_scalar_indexes(lance, output)
     manifest = update_manifest(
@@ -176,6 +185,7 @@ def main() -> int:
         frames=frame_rows,
         videos=video_rows,
         fps_values=fps_values,
+        video_camera_keys=video_camera_keys,
         indexes_created=indexes_created,
         filters={
             "min_fps": args.min_fps,
@@ -184,6 +194,7 @@ def main() -> int:
             "max_episode_frames": args.max_episode_frames,
             "drop_wrist_only": args.drop_wrist_only,
             "required_camera_keys": required_camera_keys,
+            "require_any_camera_keys": require_any_camera_keys,
             "keep_camera_keys": keep_camera_keys,
             "filtered_reasons": dict(filtered_reasons),
         },
@@ -232,6 +243,18 @@ def read_fps_values(episodes: Any) -> list[float]:
     return sorted(values)
 
 
+def read_video_camera_keys(videos: Any) -> list[str]:
+    columns = [name for name in ("camera_name", "camera_id") if name in videos.schema.names]
+    if not columns:
+        return []
+    values = set()
+    for row in scan_rows_local(videos, columns=columns, batch_size=4096):
+        key = row.get("camera_name") or row.get("camera_id")
+        if key:
+            values.add(normalize_camera_key(str(key)))
+    return sorted(values)
+
+
 def table_path(root: Path, manifest: dict[str, Any], name: str, *, fallback: str | None = None) -> Path:
     tables = manifest.get("tables") or {}
     entry = tables.get(name) or (tables.get(fallback) if fallback else None)
@@ -253,9 +276,10 @@ def build_filtered_episode_map(
     max_fps: float,
     drop_wrist_only: bool,
     required_camera_keys: list[str],
+    require_any_camera_keys: list[str],
 ) -> tuple[dict[int, int], Counter[str]]:
     wanted_columns = ["episode_index", "length", "timestamps", "fps"]
-    if drop_wrist_only or required_camera_keys:
+    if drop_wrist_only or required_camera_keys or require_any_camera_keys:
         wanted_columns.append("camera_segments")
     columns = [name for name in wanted_columns if name in episodes.schema.names]
     mapping: dict[int, int] = {}
@@ -270,6 +294,7 @@ def build_filtered_episode_map(
             max_fps=max_fps,
             drop_wrist_only=drop_wrist_only,
             required_camera_keys=required_camera_keys,
+            require_any_camera_keys=require_any_camera_keys,
         )
         if reason:
             reasons[reason] += 1
@@ -287,6 +312,7 @@ def filter_reason(
     max_fps: float,
     drop_wrist_only: bool,
     required_camera_keys: list[str],
+    require_any_camera_keys: list[str],
 ) -> str | None:
     reason = episode_filter_reason(
         row,
@@ -301,6 +327,8 @@ def filter_reason(
         return "wrist_only_camera_set"
     if required_camera_keys and missing_required_camera_keys(row, required_camera_keys):
         return "missing_required_cameras"
+    if require_any_camera_keys and not has_any_camera_key(row, require_any_camera_keys):
+        return "missing_required_head_camera"
     return None
 
 
@@ -311,6 +339,10 @@ def is_wrist_only_episode(row: dict[str, Any]) -> bool:
 def missing_required_camera_keys(row: dict[str, Any], required_camera_keys: list[str]) -> bool:
     keys = camera_key_set(row.get("camera_segments"))
     return not set(required_camera_keys).issubset(keys)
+
+
+def has_any_camera_key(row: dict[str, Any], require_any_camera_keys: list[str]) -> bool:
+    return bool(camera_key_set(row.get("camera_segments")).intersection(require_any_camera_keys))
 
 
 def camera_key_set(camera_segments: Any) -> frozenset[str]:
@@ -505,6 +537,7 @@ def update_manifest(
     frames: int,
     videos: int,
     fps_values: list[float],
+    video_camera_keys: list[str],
     indexes_created: list[dict[str, Any]],
     filters: dict[str, Any],
 ) -> dict[str, Any]:
@@ -538,7 +571,7 @@ def update_manifest(
     }
     keep_camera_keys = filters.get("keep_camera_keys") or []
     if keep_camera_keys:
-        prune_manifest_camera_modalities(out, keep_camera_keys)
+        prune_manifest_camera_modalities(out, video_camera_keys or keep_camera_keys)
     return out
 
 

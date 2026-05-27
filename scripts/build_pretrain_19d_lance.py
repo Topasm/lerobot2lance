@@ -1960,6 +1960,12 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
                     if quality_filters.get("required_camera_keys")
                     else "none"
                 ),
+                "- Require any camera keys: "
+                + (
+                    ", ".join(quality_filters.get("require_any_camera_keys") or [])
+                    if quality_filters.get("require_any_camera_keys")
+                    else "none"
+                ),
                 "- Kept camera keys: "
                 + (
                     ", ".join(quality_filters.get("keep_camera_keys") or [])
