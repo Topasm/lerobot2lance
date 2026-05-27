@@ -39,6 +39,14 @@ from scripts.build_pretrain_19d_lance import (  # noqa: E402
 )
 
 
+WRIST_ONLY_CAMERA_KEYS = frozenset(
+    {
+        "observation.images.cam_wrist_left",
+        "observation.images.cam_wrist_right",
+    }
+)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Filter an existing published Lance bundle by episode length/FPS."
@@ -54,6 +62,11 @@ def main() -> int:
     parser.add_argument("--episode-batch-size", type=int, default=64)
     parser.add_argument("--frame-batch-size", type=int, default=100_000)
     parser.add_argument("--video-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--drop-wrist-only",
+        action="store_true",
+        help="Exclude episodes whose camera set is only cam_wrist_left/cam_wrist_right.",
+    )
     args = parser.parse_args()
 
     source = args.source.resolve()
@@ -82,6 +95,7 @@ def main() -> int:
         max_episode_frames=args.max_episode_frames,
         min_fps=args.min_fps,
         max_fps=args.max_fps,
+        drop_wrist_only=args.drop_wrist_only,
     )
     if not episode_map:
         raise SystemExit("No episodes remained after filters.")
@@ -143,6 +157,7 @@ def main() -> int:
             "max_fps": args.max_fps,
             "min_episode_frames": args.min_episode_frames,
             "max_episode_frames": args.max_episode_frames,
+            "drop_wrist_only": args.drop_wrist_only,
             "filtered_reasons": dict(filtered_reasons),
         },
     )
@@ -209,8 +224,12 @@ def build_filtered_episode_map(
     max_episode_frames: int,
     min_fps: float,
     max_fps: float,
+    drop_wrist_only: bool,
 ) -> tuple[dict[int, int], Counter[str]]:
-    columns = [name for name in ("episode_index", "length", "timestamps", "fps") if name in episodes.schema.names]
+    wanted_columns = ["episode_index", "length", "timestamps", "fps"]
+    if drop_wrist_only:
+        wanted_columns.append("camera_segments")
+    columns = [name for name in wanted_columns if name in episodes.schema.names]
     mapping: dict[int, int] = {}
     reasons: Counter[str] = Counter()
     for row in scan_rows_local(episodes, columns=columns, batch_size=4096):
@@ -221,6 +240,7 @@ def build_filtered_episode_map(
             max_episode_frames=max_episode_frames,
             min_fps=min_fps,
             max_fps=max_fps,
+            drop_wrist_only=drop_wrist_only,
         )
         if reason:
             reasons[reason] += 1
@@ -236,14 +256,44 @@ def filter_reason(
     max_episode_frames: int,
     min_fps: float,
     max_fps: float,
+    drop_wrist_only: bool,
 ) -> str | None:
-    return episode_filter_reason(
+    reason = episode_filter_reason(
         row,
         min_episode_frames=min_episode_frames,
         max_episode_frames=max_episode_frames,
         min_fps=min_fps,
         max_fps=max_fps,
     )
+    if reason:
+        return reason
+    if drop_wrist_only and is_wrist_only_episode(row):
+        return "wrist_only_camera_set"
+    return None
+
+
+def is_wrist_only_episode(row: dict[str, Any]) -> bool:
+    return camera_key_set(row.get("camera_segments")) == WRIST_ONLY_CAMERA_KEYS
+
+
+def camera_key_set(camera_segments: Any) -> frozenset[str]:
+    keys = set()
+    for segment in camera_segments or []:
+        if not isinstance(segment, dict):
+            continue
+        key = segment.get("camera_key") or segment.get("source_key") or segment.get("camera_column")
+        if key is None:
+            continue
+        keys.add(normalize_camera_key(str(key)))
+    return frozenset(keys)
+
+
+def normalize_camera_key(key: str) -> str:
+    if key.startswith("observation.images."):
+        return key
+    if key.startswith("observation_images_"):
+        return "observation.images." + key.removeprefix("observation_images_")
+    return key
 
 
 def write_episode_table(

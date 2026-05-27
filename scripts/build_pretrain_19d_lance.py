@@ -1953,6 +1953,7 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
                 f"- Max FPS: {quality_filters.get('max_fps')}",
                 f"- Min episode frames: {quality_filters.get('min_episode_frames')}",
                 f"- Max episode frames: {quality_filters.get('max_episode_frames') or 'disabled'}",
+                f"- Drop wrist-only episodes: {quality_filters.get('drop_wrist_only', False)}",
                 "- Filtered episodes: "
                 + (
                     ", ".join(f"{reason}={count}" for reason, count in sorted(filtered_reasons.items()))
