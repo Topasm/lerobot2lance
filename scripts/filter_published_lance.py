@@ -127,6 +127,7 @@ def main() -> int:
         episode_map,
         batch_size=args.video_batch_size,
     )
+    fps_values = read_fps_values(lance.dataset(str(output / "data" / "episodes.lance")))
 
     indexes_created = create_scalar_indexes(lance, output)
     manifest = update_manifest(
@@ -135,6 +136,7 @@ def main() -> int:
         episodes=len(episode_map),
         frames=frame_rows,
         videos=video_rows,
+        fps_values=fps_values,
         indexes_created=indexes_created,
         filters={
             "min_fps": args.min_fps,
@@ -175,6 +177,17 @@ def main() -> int:
         flush=True,
     )
     return 0
+
+
+def read_fps_values(episodes: Any) -> list[float]:
+    if "fps" not in episodes.schema.names:
+        return []
+    values = {
+        float(row["fps"])
+        for row in scan_rows_local(episodes, columns=["fps"], batch_size=4096)
+        if row.get("fps") is not None
+    }
+    return sorted(values)
 
 
 def table_path(root: Path, manifest: dict[str, Any], name: str, *, fallback: str | None = None) -> Path:
@@ -377,6 +390,7 @@ def update_manifest(
     episodes: int,
     frames: int,
     videos: int,
+    fps_values: list[float],
     indexes_created: list[dict[str, Any]],
     filters: dict[str, Any],
 ) -> dict[str, Any]:
@@ -391,6 +405,12 @@ def update_manifest(
         "frames": frames,
         "videos": videos,
     }
+    if fps_values:
+        rates = dict(out.get("rates") or {})
+        rates["fps_values"] = fps_values
+        rates["fps_mode"] = "single" if len(fps_values) <= 1 else "mixed"
+        rates["fps"] = 10.0 if 10.0 in fps_values else fps_values[0]
+        out["rates"] = rates
     out["tables"] = {
         "episodes": {"path": "data/episodes.lance", "exists": True},
         "train_episodes": {"path": "data/train_episodes.lance", "exists": True},
