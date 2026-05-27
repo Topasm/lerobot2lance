@@ -1954,6 +1954,18 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
                 f"- Min episode frames: {quality_filters.get('min_episode_frames')}",
                 f"- Max episode frames: {quality_filters.get('max_episode_frames') or 'disabled'}",
                 f"- Drop wrist-only episodes: {quality_filters.get('drop_wrist_only', False)}",
+                "- Required camera keys: "
+                + (
+                    ", ".join(quality_filters.get("required_camera_keys") or [])
+                    if quality_filters.get("required_camera_keys")
+                    else "none"
+                ),
+                "- Kept camera keys: "
+                + (
+                    ", ".join(quality_filters.get("keep_camera_keys") or [])
+                    if quality_filters.get("keep_camera_keys")
+                    else "all"
+                ),
                 "- Filtered episodes: "
                 + (
                     ", ".join(f"{reason}={count}" for reason, count in sorted(filtered_reasons.items()))

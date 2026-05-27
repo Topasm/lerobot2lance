@@ -47,6 +47,9 @@ WRIST_ONLY_CAMERA_KEYS = frozenset(
 )
 
 
+DEFAULT_REQUIRED_CAMERA_KEYS: tuple[str, ...] = ()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Filter an existing published Lance bundle by episode length/FPS."
@@ -67,7 +70,25 @@ def main() -> int:
         action="store_true",
         help="Exclude episodes whose camera set is only cam_wrist_left/cam_wrist_right.",
     )
+    parser.add_argument(
+        "--required-camera-keys",
+        nargs="*",
+        default=list(DEFAULT_REQUIRED_CAMERA_KEYS),
+        help=(
+            "Exclude episodes missing any of these camera keys. "
+            "Example: --required-camera-keys observation.images.cam_head "
+            "observation.images.cam_wrist_left observation.images.cam_wrist_right."
+        ),
+    )
+    parser.add_argument(
+        "--keep-camera-keys",
+        nargs="*",
+        default=[],
+        help="When set, keep only these cameras in episode camera_segments, videos, and manifest modalities.",
+    )
     args = parser.parse_args()
+    required_camera_keys = sorted({normalize_camera_key(key) for key in args.required_camera_keys})
+    keep_camera_keys = sorted({normalize_camera_key(key) for key in args.keep_camera_keys})
 
     source = args.source.resolve()
     output = args.output.resolve()
@@ -96,6 +117,7 @@ def main() -> int:
         min_fps=args.min_fps,
         max_fps=args.max_fps,
         drop_wrist_only=args.drop_wrist_only,
+        required_camera_keys=required_camera_keys,
     )
     if not episode_map:
         raise SystemExit("No episodes remained after filters.")
@@ -119,6 +141,7 @@ def main() -> int:
         output / "data" / "episodes.lance",
         episode_map,
         batch_size=args.episode_batch_size,
+        keep_camera_keys=keep_camera_keys,
     )
     write_episode_table(
         lance,
@@ -126,6 +149,7 @@ def main() -> int:
         output / "data" / "train_episodes.lance",
         episode_map,
         batch_size=args.episode_batch_size,
+        keep_camera_keys=keep_camera_keys,
     )
     frame_rows = write_frame_table(
         lance,
@@ -140,6 +164,7 @@ def main() -> int:
         output / "data" / "videos.lance",
         episode_map,
         batch_size=args.video_batch_size,
+        keep_camera_keys=keep_camera_keys,
     )
     fps_values = read_fps_values(lance.dataset(str(output / "data" / "episodes.lance")))
 
@@ -158,6 +183,8 @@ def main() -> int:
             "min_episode_frames": args.min_episode_frames,
             "max_episode_frames": args.max_episode_frames,
             "drop_wrist_only": args.drop_wrist_only,
+            "required_camera_keys": required_camera_keys,
+            "keep_camera_keys": keep_camera_keys,
             "filtered_reasons": dict(filtered_reasons),
         },
     )
@@ -225,9 +252,10 @@ def build_filtered_episode_map(
     min_fps: float,
     max_fps: float,
     drop_wrist_only: bool,
+    required_camera_keys: list[str],
 ) -> tuple[dict[int, int], Counter[str]]:
     wanted_columns = ["episode_index", "length", "timestamps", "fps"]
-    if drop_wrist_only:
+    if drop_wrist_only or required_camera_keys:
         wanted_columns.append("camera_segments")
     columns = [name for name in wanted_columns if name in episodes.schema.names]
     mapping: dict[int, int] = {}
@@ -241,6 +269,7 @@ def build_filtered_episode_map(
             min_fps=min_fps,
             max_fps=max_fps,
             drop_wrist_only=drop_wrist_only,
+            required_camera_keys=required_camera_keys,
         )
         if reason:
             reasons[reason] += 1
@@ -257,6 +286,7 @@ def filter_reason(
     min_fps: float,
     max_fps: float,
     drop_wrist_only: bool,
+    required_camera_keys: list[str],
 ) -> str | None:
     reason = episode_filter_reason(
         row,
@@ -269,11 +299,18 @@ def filter_reason(
         return reason
     if drop_wrist_only and is_wrist_only_episode(row):
         return "wrist_only_camera_set"
+    if required_camera_keys and missing_required_camera_keys(row, required_camera_keys):
+        return "missing_required_cameras"
     return None
 
 
 def is_wrist_only_episode(row: dict[str, Any]) -> bool:
     return camera_key_set(row.get("camera_segments")) == WRIST_ONLY_CAMERA_KEYS
+
+
+def missing_required_camera_keys(row: dict[str, Any], required_camera_keys: list[str]) -> bool:
+    keys = camera_key_set(row.get("camera_segments"))
+    return not set(required_camera_keys).issubset(keys)
 
 
 def camera_key_set(camera_segments: Any) -> frozenset[str]:
@@ -303,6 +340,7 @@ def write_episode_table(
     episode_map: dict[int, int],
     *,
     batch_size: int,
+    keep_camera_keys: list[str],
 ) -> int:
     ds = lance.dataset(str(source_path))
     total = 0
@@ -315,6 +353,7 @@ def write_episode_table(
             if new_episode is None:
                 continue
             row["episode_index"] = new_episode
+            prune_row_camera_segments(row, keep_camera_keys)
             rows.append(row)
         if rows:
             write_rows(lance, rows, ds.schema, target_path, mode=mode)
@@ -358,6 +397,7 @@ def write_video_table(
     episode_map: dict[int, int],
     *,
     batch_size: int,
+    keep_camera_keys: list[str],
 ) -> int:
     ds = lance.dataset(str(source_path))
     source_columns = set(ds.schema.names)
@@ -365,6 +405,7 @@ def write_video_table(
     total = 0
     source_row_index = 0
     mode = "overwrite"
+    keep = set(keep_camera_keys)
     for batch in scan_batches(ds, batch_size=batch_size):
         rows = []
         for row in batch.to_pylist():
@@ -373,6 +414,8 @@ def write_video_table(
             old_episode = int(row["episode_index"])
             new_episode = episode_map.get(old_episode)
             if new_episode is None:
+                continue
+            if keep and video_row_camera_key(row) not in keep:
                 continue
             row["episode_index"] = new_episode
             materialize_blobs(ds, row, source_columns, blob_columns, this_row_index)
@@ -400,6 +443,27 @@ def write_rows(lance: Any, rows: list[dict[str, Any]], schema: Any, target_path:
         str(target_path),
         mode=mode,
         data_storage_version=LANCE_DATA_STORAGE_VERSION,
+    )
+
+
+def prune_row_camera_segments(row: dict[str, Any], keep_camera_keys: list[str]) -> None:
+    if not keep_camera_keys or "camera_segments" not in row:
+        return
+    keep = set(keep_camera_keys)
+    row["camera_segments"] = [
+        segment
+        for segment in row.get("camera_segments") or []
+        if isinstance(segment, dict) and segment_camera_key(segment) in keep
+    ]
+
+
+def video_row_camera_key(row: dict[str, Any]) -> str:
+    return normalize_camera_key(str(row.get("camera_name") or row.get("camera_key") or row.get("camera_id") or ""))
+
+
+def segment_camera_key(segment: dict[str, Any]) -> str:
+    return normalize_camera_key(
+        str(segment.get("camera_key") or segment.get("source_key") or segment.get("camera_column") or "")
     )
 
 
@@ -472,7 +536,29 @@ def update_manifest(
         **(out.get("indexes") or {}),
         "created": indexes_created,
     }
+    keep_camera_keys = filters.get("keep_camera_keys") or []
+    if keep_camera_keys:
+        prune_manifest_camera_modalities(out, keep_camera_keys)
     return out
+
+
+def prune_manifest_camera_modalities(manifest: dict[str, Any], keep_camera_keys: list[str]) -> None:
+    keep = set(keep_camera_keys)
+    modalities = manifest.get("modalities")
+    if isinstance(modalities, dict):
+        manifest["modalities"] = {
+            key: value
+            for key, value in modalities.items()
+            if not (isinstance(value, dict) and value.get("kind") == "video")
+            or value.get("camera_key") in keep
+        }
+    rates = manifest.get("rates")
+    if isinstance(rates, dict) and isinstance(rates.get("modalities"), dict):
+        rates["modalities"] = {
+            key: value
+            for key, value in rates["modalities"].items()
+            if not key.startswith("video.") or f"observation.images.{key.removeprefix('video.')}" in keep
+        }
 
 
 def build_sessions(output: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
