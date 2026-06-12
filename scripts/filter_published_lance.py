@@ -33,7 +33,7 @@ from scripts.build_pretrain_19d_lance import (  # noqa: E402
     write_stats_sidecars,
     write_tasks_jsonl,
 )
-from scripts.lance_publish_utils import (  # noqa: E402
+from lerobot2lance.lance_utils import (  # noqa: E402
     LANCE_DATA_STORAGE_VERSION,
     add_compaction_args,
     cleanup_lance_tables,

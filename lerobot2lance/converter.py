@@ -28,15 +28,18 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from lerobot2lance.lance_utils import (
+    LANCE_BLOB_ENCODING,
+    LANCE_DATA_STORAGE_VERSION,
+    PUBLISHED_BLOB_POLICY,
+    table_from_pylist_with_blob_columns,
+)
+
 
 RLLAB_SESSION_FORMAT = "rllab_lance_session_v2"
 RLLAB_PUBLISHED_FORMAT = "rllab_published_lance_dataset_v2"
 RLLAB_SCHEMA_VERSION = "2.0"
 RLLAB_PUBLISHED_LAYOUT = "rllab_published_dataset_v2"
-LANCE_DATA_STORAGE_VERSION = "2.2"
-LANCE_BLOB_ENCODING = "lance.blob.v2"
-PUBLISHED_BLOB_POLICY = "inline_bytes_only"
-
 # Keep a single videos.lance fragment under HF LFS object limits so very large
 # bundles stay pushable. 2 GB is well under HF's per-object cap and gives good
 # parallel-download granularity.
@@ -464,7 +467,7 @@ def convert_lerobot_to_lance(
 
     if media_rows or output_layout == "hf":
         media_schema = _build_media_schema(pa, lance)
-        media_table = _table_from_pylist_with_blob_columns(
+        media_table = table_from_pylist_with_blob_columns(
             pa,
             lance,
             media_rows,
@@ -596,35 +599,6 @@ def _write_lance_table(
             continue
         created.append({"column": column, "index_type": index_type})
     return created
-
-
-def _table_from_pylist_with_blob_columns(
-    pa: Any,
-    lance: Any,
-    rows: list[dict[str, Any]],
-    *,
-    schema: Any,
-    blob_columns: set[str],
-) -> Any:
-    arrays = []
-    for field in schema:
-        values = [row.get(field.name) for row in rows]
-        if field.name in blob_columns:
-            _validate_inline_blob_values(values, field.name)
-            arrays.append(lance.blob_array(values))
-        else:
-            arrays.append(pa.array(values, type=field.type))
-    return pa.Table.from_arrays(arrays, schema=schema)
-
-
-def _validate_inline_blob_values(values: list[Any], column: str) -> None:
-    for value in values:
-        if value is None or isinstance(value, (bytes, bytearray, memoryview)):
-            continue
-        raise TypeError(
-            f"{column} must contain inline bytes only for published v1 bundles; "
-            f"got {type(value).__name__}"
-        )
 
 
 def _load_info(source: Path) -> dict[str, Any]:
@@ -1047,7 +1021,7 @@ def _trajectory_sha256(
         actions            : float32 × length × action_dim  (row-major)
 
     NaN and ±Inf are forbidden in the canonical trajectory arrays. JSON-based
-    hashing is not valid for v1.0; cross-implementation reproducibility was the
+    hashing is not valid for v2.0; cross-implementation reproducibility was the
     motivating reason for the binary form.
     """
     length = len(timestamps)

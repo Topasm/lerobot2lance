@@ -9,8 +9,7 @@ Readers may probe the format discriminator to refuse v1 input cleanly, but they
 do not provide a translation layer.
 
 This checklist is the working tracker for promoting the v2 contract to stable.
-The full design rationale lives in [`STANDARD.md`](STANDARD.md) and the
-deeper plan in [`checklist.md`](checklist.md).
+The full design rationale lives in [`STANDARD.md`](STANDARD.md).
 
 ## Status (in-repo)
 

@@ -1,4 +1,4 @@
-"""Shared helpers for RLLAB published Lance bundle writers."""
+"""Shared Lance helpers for RLLAB published bundle writers."""
 
 from __future__ import annotations
 

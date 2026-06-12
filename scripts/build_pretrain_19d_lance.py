@@ -33,40 +33,22 @@ import struct
 from pathlib import Path
 from typing import Any
 
-try:
-    from scripts.lance_publish_utils import (
-        COMPACT_MAX_BYTES_PER_FILE,
-        COMPACT_NUM_THREADS,
-        LANCE_BLOB_ENCODING,
-        LANCE_DATA_STORAGE_VERSION,
-        PUBLISHED_BLOB_POLICY,
-        add_compaction_args,
-        assert_lance_storage_version,
-        clear_blobs,
-        cleanup_lance_tables,
-        compact_lance_tables,
-        is_blob_field,
-        materialize_blobs,
-        scan_batches,
-        table_from_pylist_with_blob_columns,
-    )
-except ModuleNotFoundError:
-    from lance_publish_utils import (
-        COMPACT_MAX_BYTES_PER_FILE,
-        COMPACT_NUM_THREADS,
-        LANCE_BLOB_ENCODING,
-        LANCE_DATA_STORAGE_VERSION,
-        PUBLISHED_BLOB_POLICY,
-        add_compaction_args,
-        assert_lance_storage_version,
-        clear_blobs,
-        cleanup_lance_tables,
-        compact_lance_tables,
-        is_blob_field,
-        materialize_blobs,
-        scan_batches,
-        table_from_pylist_with_blob_columns,
-    )
+from lerobot2lance.lance_utils import (
+    COMPACT_MAX_BYTES_PER_FILE,
+    COMPACT_NUM_THREADS,
+    LANCE_BLOB_ENCODING,
+    LANCE_DATA_STORAGE_VERSION,
+    PUBLISHED_BLOB_POLICY,
+    add_compaction_args,
+    assert_lance_storage_version,
+    clear_blobs,
+    cleanup_lance_tables,
+    compact_lance_tables,
+    is_blob_field,
+    materialize_blobs,
+    scan_batches,
+    table_from_pylist_with_blob_columns,
+)
 
 
 PUBLISHED_FORMAT = "rllab_published_lance_dataset_v2"

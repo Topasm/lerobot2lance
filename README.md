@@ -1,6 +1,6 @@
 # lerobot2lance
 
-Convert a local **[LeRobot](https://github.com/huggingface/lerobot)** v2.1 or v3 dataset into a **[Lance](https://lancedb.com/)** session bundle that downstream Lance-native tools can open directly.
+Convert a local **[LeRobot](https://github.com/huggingface/lerobot)** v2.1 or v3 dataset into an RLLAB **[Lance](https://lancedb.com/)** bundle that downstream Lance-native tools can open directly.
 
 The two LeRobot disk layouts are auto-detected:
 
@@ -103,15 +103,13 @@ A `progress_callback(kind, payload)` is invoked once per episode with `kind="epi
 
 ```text
 target/
-  manifest.json           # rllab_published_lance_dataset_v1 contract
+  manifest.json           # rllab_published_lance_dataset_v2 contract
   README.md               # dataset card
   meta/
     info.json             # copy of the source LeRobot info.json (used by viewers for codec metadata)
-    stats.json            # LeRobot-compatible observation.state/action normalization stats
     stats/
       state_body.json     # per-modality stats for manifest.modalities["state.body"]
       action_body.json    # per-action stats for manifest.actions["action.body"]
-    tasks.json            # task_index -> language_instruction summary
     tasks.jsonl           # LeRobot-style canonical task sidecar
     episodes.jsonl        # lightweight episode metadata sidecar
     splits.json           # train/val/test episode lists
@@ -161,8 +159,6 @@ target/
 | `camera_segments` | list&lt;struct&gt; | camera key/column, `media_id`, timestamp range, frame range |
 | `task_segments` | list&lt;struct&gt; | task index/instruction and frame/timestamp span |
 | `trajectory_sha256` | string | hash of timestamps + state/action arrays |
-| `{camera_norm}_from_timestamp` | float64 | always `0.0` for whole-episode segments |
-| `{camera_norm}_to_timestamp` | float64 | `(length - 1) / fps` |
 
 Camera-name normalization: `observation.images.cam_head` → `observation_images_cam_head` (Lance column-name rules require underscore-only). The original dotted name stays in `meta/info.json` for viewer reference.
 
@@ -171,11 +167,11 @@ Camera-name normalization: `observation.images.cam_head` → `observation_images
 The converter does not shift actions to the next state; this is recorded in
 `manifest.json.state_action_alignment.type = "same_frame_timestamp"`.
 
-`frames.lance` also includes `global_frame_index`, `state_norm`, `action_norm`, and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic statistics. Its frame-level columns are `observation_state` and singular `action`; these are the frame-row expansion of episode-level `observation_state` and `actions`.
+`frames.lance` also includes `global_frame_index` and `is_bad_frame=false` so Robot Data Studio can run frame-level QA without recomputing basic metadata. Its frame-level columns are `observation_state` and singular `action`; these are the frame-row expansion of episode-level `observation_state` and `actions`.
 
-The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) is the only place video bytes are stored. It includes `episode_index`, `camera_name` (original dotted LeRobot feature key), `media_type`, `relative_path`, `source_uri`, `source_dataset_url`, `video_blob`, `from_timestamp`, `to_timestamp`, `sha256`, `byte_size`, `num_frames`, `fps`, `width_pixels`, `height_pixels`, and `codec`. `uri` and `video_path` are kept only as compatibility aliases; new readers should use `relative_path` and `source_uri`.
+The media table (`media.lance` in session layout, `data/videos.lance` in HF/published layout) is the only place video bytes are stored. In published v2 it uses canonical columns such as `media_id`, `episode_index`, `camera_id`, `camera_name`, `relative_path`, `source_uri`, `video_blob`, timestamp bounds, `sha256`, `byte_size`, frame count, `fps`, resolution, and `codec`.
 
-`manifest.json` names the `primary_training_table` (`episodes.lance` for a direct conversion, `train_episodes.lance` for a merged pretrain bundle), records `media_mode="videos_table"`, `training_columns`, `frame_columns`, `state_action_alignment`, `modalities`, `actions`, `camera_keys`, `camera_columns`, `camera_key_to_column`, `rates`, `capabilities`, `reader_hints`, `indexes`, `fps`, `state_dim`, `action_dim`, and lists the available Lance tables. The canonical row counts live under `counts.{episodes,frames,videos}`; older `total_*` fields remain as compatibility aliases. `rllab-training`, `robo_dataview`, and the stack scripts resolve camera MP4s through the media table, so there is no second training-only video format.
+`manifest.json` names the `primary_training_table` (`episodes.lance` for a direct conversion, `train_episodes.lance` for a merged pretrain bundle), records `state_action_alignment`, `modalities`, `actions`, `rates`, `capabilities`, `reader_hints`, `indexes`, and lists the available Lance tables. The canonical row counts live under `counts.{episodes,frames,videos}`. Published v2 does not emit flat v1 aliases; see [`docs/STANDARD.md`](docs/STANDARD.md) for the exact contract. `rllab-training`, `robo_dataview`, and the stack scripts resolve camera MP4s through the media table, so there is no second training-only video format.
 
 ## 한국어 사용법
 
@@ -193,35 +189,31 @@ pip install -e ".[dev]"
 ```bash
 lerobot2lance \
   --source /path/to/lerobot_dataset \
-  --target /path/to/output_lance_session \
-  --overwrite
-```
-
-변환 결과는 현재 RLLAB/Dataview Lance 구조에 맞는 raw training session입니다.
-
-```text
-output_lance_session/
-  manifest.json
-  episodes.lance/   # raw episode training table, row 하나 = episode 하나
-  frames.lance/     # frame-level QA/search table
-  media.lance/      # canonical media table
-  meta/info.json
-```
-
-`episodes.lance`가 기본 학습 테이블입니다. Dataview에서 skill clip을 자르고 export하면, 그 curated export 쪽에서 `train_skill_clips.lance`가 생성됩니다. `lerobot2lance`는 LeRobot raw dataset을 raw Lance session으로 바꾸는 도구라서 `skills.lance`나 `train_skill_clips.lance`를 만들지 않습니다.
-
-### HF 공개용 포맷과 업로드
-
-RLLAB stack의 `data/published/<dataset_id>`와 같은 구조로 바로 만들려면:
-
-```bash
-lerobot2lance \
-  --source /path/to/lerobot_dataset \
   --target /path/to/data/published/bg2-grasp-v1 \
   --layout hf \
   --dataset-id bg2-grasp-v1 \
   --overwrite
 ```
+
+기본 출력은 RLLAB published v2 구조입니다.
+
+```text
+bg2-grasp-v1/
+  manifest.json
+  README.md
+  data/episodes.lance
+  data/frames.lance
+  data/videos.lance
+  meta/info.json
+  meta/tasks.jsonl
+  meta/episodes.jsonl
+  meta/splits.json
+  meta/stats/
+```
+
+`data/episodes.lance`가 기본 학습 테이블이고, 비디오는 `data/videos.lance`의 Lance Blob v2 컬럼에만 저장됩니다. 세부 포맷 계약은 [`docs/STANDARD.md`](docs/STANDARD.md)를 기준으로 봅니다.
+
+### 업로드
 
 업로드까지 한 번에:
 
@@ -246,11 +238,6 @@ pytest -q
 ```
 
 스택에서 사용할 때는 변환된 target 디렉터리를 그대로 Dataview나 training에 넘기면 됩니다.
-
-```bash
-./scripts/view.sh /path/to/output_lance_session
-./scripts/train_policy.sh /path/to/output_lance_session
-```
 
 ## Examples
 
@@ -328,10 +315,8 @@ data/pretrain_aiworker_19d/
   data/train_episodes.lance
   data/frames.lance
   data/videos.lance
-  meta/stats.json
   meta/stats/state_body.json
   meta/stats/action_body.json
-  meta/tasks.json
   meta/tasks.jsonl
   meta/episodes.jsonl
   meta/splits.json
