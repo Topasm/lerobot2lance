@@ -17,29 +17,31 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.build_pretrain_19d_lance import (  # noqa: E402
-    COMPACT_MAX_BYTES_PER_FILE,
-    COMPACT_NUM_THREADS,
     DEFAULT_MAX_FPS,
     DEFAULT_MIN_EPISODE_FRAMES,
     DEFAULT_MIN_FPS,
-    LANCE_DATA_STORAGE_VERSION,
     PUBLISHED_FORMAT,
     build_info,
     build_splits,
     build_tasks,
-    cleanup_lance_tables,
-    compact_lance_tables,
     compute_lerobot_stats,
     create_scalar_indexes,
     episode_filter_reason,
-    is_blob_field,
     render_readme,
-    scan_batches,
-    table_from_pylist_with_blob_columns,
     write_episodes_jsonl,
     write_json,
     write_stats_sidecars,
     write_tasks_jsonl,
+)
+from scripts.lance_publish_utils import (  # noqa: E402
+    LANCE_DATA_STORAGE_VERSION,
+    add_compaction_args,
+    cleanup_lance_tables,
+    compact_lance_tables,
+    is_blob_field,
+    materialize_blobs,
+    scan_batches,
+    table_from_pylist_with_blob_columns,
 )
 
 
@@ -69,32 +71,9 @@ def main() -> int:
     parser.add_argument("--episode-batch-size", type=int, default=64)
     parser.add_argument("--frame-batch-size", type=int, default=100_000)
     parser.add_argument("--video-batch-size", type=int, default=8)
-    parser.add_argument(
-        "--no-compact",
-        dest="compact",
-        action="store_false",
-        help="Skip final Lance rewrite/compaction. By default filtered bundles are compacted.",
-    )
-    parser.set_defaults(compact=True)
-    parser.add_argument(
-        "--compact-max-bytes",
-        type=int,
-        default=COMPACT_MAX_BYTES_PER_FILE,
-        help=(
-            "Target maximum bytes per compacted Lance file/blob batch. "
-            f"Default: {COMPACT_MAX_BYTES_PER_FILE}."
-        ),
-    )
-    parser.add_argument(
-        "--compact-num-threads",
-        type=int,
-        default=COMPACT_NUM_THREADS,
-        help=f"Threads reserved for compaction implementations. Default: {COMPACT_NUM_THREADS}.",
-    )
-    parser.add_argument(
-        "--keep-old-versions",
-        action="store_true",
-        help="Keep pre-compaction Lance versions instead of cleaning old versions.",
+    add_compaction_args(
+        parser,
+        compact_help="Skip final Lance rewrite/compaction. By default filtered bundles are compacted.",
     )
     parser.add_argument(
         "--drop-wrist-only",
@@ -540,31 +519,6 @@ def segment_camera_key(segment: dict[str, Any]) -> str:
     return normalize_camera_key(
         str(segment.get("camera_key") or segment.get("source_key") or segment.get("camera_column") or "")
     )
-
-
-def materialize_blobs(
-    ds: Any,
-    row: dict[str, Any],
-    source_columns: set[str],
-    blob_columns: set[str],
-    source_row_index: int,
-) -> None:
-    for column in blob_columns:
-        value = row.get(column)
-        if value is None or isinstance(value, (bytes, bytearray, memoryview)):
-            continue
-        if column not in source_columns:
-            row[column] = None
-            continue
-        handles = ds.take_blobs(column, indices=[source_row_index])
-        if not handles:
-            row[column] = None
-            continue
-        handle = handles[0]
-        try:
-            row[column] = handle.readall() if hasattr(handle, "readall") else handle.read()
-        finally:
-            handle.close()
 
 
 def scan_rows_local(ds: Any, *, columns: list[str], batch_size: int) -> Any:
