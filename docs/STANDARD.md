@@ -183,6 +183,12 @@ Writer requirements:
   and external URI slices are forbidden in published v2.0 bundles.
 - Legacy `large_binary + lance-encoding:blob=true` blob columns are forbidden
   in v2.0 stable bundles.
+- Published bundles SHOULD be compacted after table writes and before upload.
+  The standard writer default rewrites small batches into larger Lance
+  fragments, targets 4 GiB blob batches, recreates scalar indexes, and cleans
+  pre-compaction table versions. If compaction is used, producers SHOULD record
+  `reader_hints.fragment_strategy` with the target `max_bytes_per_file` for
+  each Lance table.
 
 ## 4. Lance tables
 

@@ -352,6 +352,15 @@ provenance columns such as `source_dataset`, `source_repo_id`,
 `pretrain_tier`. Media rows additionally keep `source_uri`, `source_local_path`,
 `source_video_table`, `source_media_id`, and `source_relative_path`.
 
+Pretrain builders and post-publish filters compact Lance tables by default
+before publishing. This rewrites the small write batches into larger Lance
+fragments, targets 4 GiB blob batches, recreates scalar indexes, and removes
+pre-compaction table versions. Keep this default for Hugging Face uploads; it
+reduces thousands of tiny files while preserving the same published
+`lance.blob.v2` inline-byte media contract. Use `--no-compact` only for local
+debugging, or `--keep-old-versions` when you explicitly need to inspect the
+pre-compaction table versions.
+
 Source repos whose names look like scratch/test uploads are excluded by default;
 pass `--include-review-names` to include them. To build only strict BG2
 full-body data, add `--strict-bg2-only`.

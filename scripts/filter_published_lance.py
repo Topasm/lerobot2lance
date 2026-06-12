@@ -17,6 +17,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.build_pretrain_19d_lance import (  # noqa: E402
+    COMPACT_MAX_BYTES_PER_FILE,
+    COMPACT_NUM_THREADS,
     DEFAULT_MAX_FPS,
     DEFAULT_MIN_EPISODE_FRAMES,
     DEFAULT_MIN_FPS,
@@ -25,6 +27,8 @@ from scripts.build_pretrain_19d_lance import (  # noqa: E402
     build_info,
     build_splits,
     build_tasks,
+    cleanup_lance_tables,
+    compact_lance_tables,
     compute_lerobot_stats,
     create_scalar_indexes,
     episode_filter_reason,
@@ -65,6 +69,33 @@ def main() -> int:
     parser.add_argument("--episode-batch-size", type=int, default=64)
     parser.add_argument("--frame-batch-size", type=int, default=100_000)
     parser.add_argument("--video-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--no-compact",
+        dest="compact",
+        action="store_false",
+        help="Skip final Lance rewrite/compaction. By default filtered bundles are compacted.",
+    )
+    parser.set_defaults(compact=True)
+    parser.add_argument(
+        "--compact-max-bytes",
+        type=int,
+        default=COMPACT_MAX_BYTES_PER_FILE,
+        help=(
+            "Target maximum bytes per compacted Lance file/blob batch. "
+            f"Default: {COMPACT_MAX_BYTES_PER_FILE}."
+        ),
+    )
+    parser.add_argument(
+        "--compact-num-threads",
+        type=int,
+        default=COMPACT_NUM_THREADS,
+        help=f"Threads reserved for compaction implementations. Default: {COMPACT_NUM_THREADS}.",
+    )
+    parser.add_argument(
+        "--keep-old-versions",
+        action="store_true",
+        help="Keep pre-compaction Lance versions instead of cleaning old versions.",
+    )
     parser.add_argument(
         "--drop-wrist-only",
         action="store_true",
@@ -174,10 +205,20 @@ def main() -> int:
         batch_size=args.video_batch_size,
         keep_camera_keys=keep_camera_keys,
     )
+    if args.compact:
+        compact_lance_tables(
+            lance,
+            output,
+            max_bytes_per_file=args.compact_max_bytes,
+            num_threads=args.compact_num_threads,
+            blob_write_target_bytes=args.compact_max_bytes,
+        )
     fps_values = read_fps_values(lance.dataset(str(output / "data" / "episodes.lance")))
     video_camera_keys = read_video_camera_keys(lance.dataset(str(output / "data" / "videos.lance")))
 
     indexes_created = create_scalar_indexes(lance, output)
+    if args.compact and not args.keep_old_versions:
+        cleanup_lance_tables(lance, output)
     manifest = update_manifest(
         manifest,
         dataset_id=args.dataset_id,
@@ -197,7 +238,9 @@ def main() -> int:
             "require_any_camera_keys": require_any_camera_keys,
             "keep_camera_keys": keep_camera_keys,
             "filtered_reasons": dict(filtered_reasons),
+            "compact_max_bytes": args.compact_max_bytes if args.compact else None,
         },
+        compact_max_bytes=args.compact_max_bytes if args.compact else None,
     )
     sessions = build_sessions(output, manifest)
     source_rows = build_source_rows(sessions, manifest)
@@ -540,6 +583,7 @@ def update_manifest(
     video_camera_keys: list[str],
     indexes_created: list[dict[str, Any]],
     filters: dict[str, Any],
+    compact_max_bytes: int | None,
 ) -> dict[str, Any]:
     out = dict(manifest)
     out["dataset_id"] = dataset_id
@@ -569,6 +613,15 @@ def update_manifest(
         **(out.get("indexes") or {}),
         "created": indexes_created,
     }
+    if compact_max_bytes:
+        reader_hints = dict(out.get("reader_hints") or {})
+        reader_hints["fragment_strategy"] = {
+            "data/episodes.lance": {"max_bytes_per_file": compact_max_bytes},
+            "data/train_episodes.lance": {"max_bytes_per_file": compact_max_bytes},
+            "data/frames.lance": {"max_bytes_per_file": compact_max_bytes},
+            "data/videos.lance": {"max_bytes_per_file": compact_max_bytes},
+        }
+        out["reader_hints"] = reader_hints
     keep_camera_keys = filters.get("keep_camera_keys") or []
     if keep_camera_keys:
         prune_manifest_camera_modalities(out, video_camera_keys or keep_camera_keys)
