@@ -59,6 +59,9 @@ DEFAULT_MAX_FPS = 30.0
 DEFAULT_MIN_EPISODE_FRAMES = 30
 STATE_DIM = 19
 ACTION_DIM = 19
+OUTPUT_ROBOT_TYPE = "aiworker_19d_mixture"
+DATASET_DESCRIPTION = "Merged 19D AI Worker/BG2 pretraining dataset in RLLAB published Lance layout."
+SOURCE_LABEL = "merged_converted_lance_bundles"
 SCALAR_INDEXES: dict[str, list[tuple[str, str]]] = {
     "episodes": [
         ("episode_index", "BTREE"),
@@ -89,11 +92,16 @@ SCALAR_INDEXES: dict[str, list[tuple[str, str]]] = {
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build a merged 19D AI Worker/BG2 pretrain Lance bundle."
+        description="Build a merged AI Worker/BG2/hand pretrain Lance bundle."
     )
     parser.add_argument("--converted-root", default="data/converted_19d")
     parser.add_argument("--output", default="data/pretrain_aiworker_19d")
     parser.add_argument("--dataset-id", default=DEFAULT_DATASET_ID)
+    parser.add_argument("--state-dim", type=int, default=STATE_DIM)
+    parser.add_argument("--action-dim", type=int, default=ACTION_DIM)
+    parser.add_argument("--output-robot-type", default=OUTPUT_ROBOT_TYPE)
+    parser.add_argument("--description", default=DATASET_DESCRIPTION)
+    parser.add_argument("--source-label", default=SOURCE_LABEL)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--strict-bg2-only", action="store_true")
     parser.add_argument(
@@ -146,6 +154,11 @@ def main() -> int:
         compact_help="Skip final Lance compaction. By default the builder compacts tables.",
     )
     args = parser.parse_args()
+    globals()["STATE_DIM"] = int(args.state_dim)
+    globals()["ACTION_DIM"] = int(args.action_dim)
+    globals()["OUTPUT_ROBOT_TYPE"] = str(args.output_robot_type)
+    globals()["DATASET_DESCRIPTION"] = str(args.description)
+    globals()["SOURCE_LABEL"] = str(args.source_label)
 
     converted_root = Path(args.converted_root)
     output = Path(args.output)
@@ -162,7 +175,9 @@ def main() -> int:
     if args.limit_sources is not None:
         sources = sources[: args.limit_sources]
     if not sources:
-        raise SystemExit(f"No eligible 19D converted bundles found under {converted_root}")
+        raise SystemExit(
+            f"No eligible {STATE_DIM}D/{ACTION_DIM}D converted bundles found under {converted_root}"
+        )
 
     if output.exists():
         if not args.overwrite:
@@ -336,6 +351,8 @@ def main() -> int:
                 **session,
                 "state_dim": source.get("state_dim"),
                 "action_dim": source.get("action_dim"),
+                "state_names": source.get("state_names") or [],
+                "action_names": source.get("action_names") or [],
                 "source_camera_keys": source.get("camera_keys") or [],
                 "source_camera_columns": source.get("camera_columns") or [],
             }
@@ -431,9 +448,9 @@ def discover_sources(
             continue
         state_dim = registry_shape_dim(manifest, "modalities", "state.body")
         action_dim = registry_shape_dim(manifest, "actions", "action.body")
-        if state_dim != 19:
+        if state_dim != STATE_DIM:
             continue
-        if action_dim != 19:
+        if action_dim != ACTION_DIM:
             continue
         info = read_json_if_exists(bundle / "meta" / "info.json")
         session = first_session(bundle)
@@ -488,6 +505,8 @@ def discover_sources(
                 "action_dim": action_dim,
                 "camera_keys": camera_keys,
                 "camera_columns": camera_columns,
+                "state_names": ((info.get("features") or {}).get("observation.state") or {}).get("names") or [],
+                "action_names": ((info.get("features") or {}).get("action") or {}).get("names") or [],
             }
         )
     rows.sort(key=lambda row: (str(row.get("source_repo_id")), str(row.get("path"))))
@@ -1362,7 +1381,7 @@ def build_manifest(
         },
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset_id": dataset_id,
-        "source": "merged_converted_19d_lance_bundles",
+        "source": SOURCE_LABEL,
         "quality_filters": quality_filters or {},
         "primary_training_table": "data/train_episodes.lance",
         "state_action_alignment": {
@@ -1511,7 +1530,7 @@ def build_modalities(camera_keys: list[str], camera_columns: list[str], fps: flo
             "frame_path": "data/frames.lance",
             "frame_column": "observation_state",
             "names_ref": "meta/info.json#/features/observation.state/names",
-            "shape": [19],
+            "shape": [STATE_DIM],
             "shape_policy": "single",
             "rate_hz": fps,
             "stats": "meta/stats/state_body.json",
@@ -1548,7 +1567,7 @@ def build_actions(fps: float) -> dict[str, Any]:
             "frame_path": "data/frames.lance",
             "frame_column": "action",
             "names_ref": "meta/info.json#/features/action/names",
-            "shape": [19],
+            "shape": [ACTION_DIM],
             "shape_policy": "single",
             "rate_hz": fps,
             "stats": "meta/stats/action_body.json",
@@ -1566,16 +1585,18 @@ def build_actions(fps: float) -> dict[str, Any]:
 
 
 def build_info(dataset_id: str, manifest: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    state_names = shared_feature_names(sources, "state_names", STATE_DIM, "state")
+    action_names = shared_feature_names(sources, "action_names", ACTION_DIM, "action")
     features: dict[str, Any] = {
         "observation.state": {
             "dtype": "float32",
-            "shape": [19],
-            "names": ["state"],
+            "shape": [STATE_DIM],
+            "names": state_names,
         },
         "action": {
             "dtype": "float32",
-            "shape": [19],
-            "names": ["action"],
+            "shape": [ACTION_DIM],
+            "names": action_names,
         },
     }
     camera_entries = [
@@ -1600,9 +1621,25 @@ def build_info(dataset_id: str, manifest: dict[str, Any], sources: list[dict[str
         "total_frames": manifest["counts"]["frames"],
         "total_videos": manifest["counts"]["videos"],
         "total_source_datasets": len(sources),
-        "robot_type": "aiworker_19d_mixture",
+        "robot_type": OUTPUT_ROBOT_TYPE,
         "features": features,
     }
+
+
+def shared_feature_names(
+    sources: list[dict[str, Any]],
+    key: str,
+    dim: int,
+    fallback_prefix: str,
+) -> list[str]:
+    candidates = [
+        list(source.get(key) or [])
+        for source in sources
+        if len(source.get(key) or []) == dim
+    ]
+    if candidates and all(names == candidates[0] for names in candidates):
+        return candidates[0]
+    return [f"{fallback_prefix}_{index}" for index in range(dim)]
 
 
 def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict[str, Any]]) -> str:
@@ -1626,7 +1663,7 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
         "",
         f"# {dataset_id}",
         "",
-        "Merged 19D AI Worker/BG2 pretraining dataset in RLLAB published Lance layout.",
+        DATASET_DESCRIPTION,
         "",
         "## Tables",
         "",
@@ -1643,7 +1680,7 @@ def render_readme(dataset_id: str, manifest: dict[str, Any], sessions: list[dict
         f"- Episodes: {manifest['counts']['episodes']}",
         f"- Frames: {manifest['counts']['frames']}",
         f"- Videos: {manifest['counts']['videos']}",
-        "- Action/state dim: 19 / 19",
+        f"- Action/state dim: {ACTION_DIM} / {STATE_DIM}",
         f"- FPS values: {', '.join(str(v) for v in (manifest.get('rates') or {}).get('fps_values') or [])}",
         f"- Format: {manifest['format']} / schema {manifest['schema_version']}",
         f"- Blob storage: {manifest['lance']['blob_encoding']} ({manifest['lance']['published_blob_policy']})",
